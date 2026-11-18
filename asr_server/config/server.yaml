@@ -1,0 +1,52 @@
+# asr_server configuration. Replaces the former command-line flags of server.py.
+# Defaults follow the native-vLLM + Silero server. Unknown keys are rejected.
+
+server:
+  host: 0.0.0.0
+  port: 50051
+  max_streams: 64            # gRPC maximum_concurrent_rpcs; not a measured capacity
+  ingress_max_ms: 3000       # audio allowed to wait for ASR per stream; above it the stream is
+                             # closed with RESOURCE_EXHAUSTED. 0 = unlimited
+  audio_timeout_ms: 2000     # open utterance and no audio for this long -> commit. 0 = disabled
+
+asr:
+  backend: native_vllm       # native_vllm: vllm.LLM.chat(), language auto-detected
+                             # qwen_asr:    qwen_asr package streaming state
+  model: /opt/models/Qwen3-ASR-1.7B
+  chunk_sec: 1.0             # audio between two PARTIAL inferences
+  max_utterance_sec: 15.0    # forced split to bound GPU cost
+  max_new_tokens: 256
+  gpu_memory_utilization: 0.75
+  max_model_len: 8192        # native_vllm only
+  max_num_seqs: 1            # native_vllm only
+  dtype: float16             # native_vllm only: auto | float16 | bfloat16
+  enforce_eager: false       # native_vllm only: true disables CUDA graphs to reduce VRAM
+  max_consecutive_errors: 3  # model failures in a row before the stream is closed (UNAVAILABLE)
+  partial_max_backlog_ms: 500  # more audio than this waiting in the stream's queue: skip the PARTIAL
+                             # inference and keep the audio for the next one. A FINAL is always
+                             # inferred. 0 = never skip (use it for --fast throughput measurements)
+  use_language_source: false # true: AudioChunk.language_source overrides AudioChunk.language
+
+vad:
+  backend: silero            # silero | webrtc
+  silero_model: /opt/models/silero_vad.jit   # local TorchScript file, required for silero
+  threshold: 0.5             # silero: speech onset probability
+  neg_threshold: null        # silero: speech exit probability; null = threshold - 0.15
+  workers: 2                 # threads that load and run Silero (CPU)
+  mode: 2                    # webrtc only: aggressiveness, 0..3
+  endpoint_ms: 600           # silence that commits an utterance
+  pause_ms: 300              # pause candidate for semantic early commit
+  min_voiced_ms: 160         # utterances with less voiced audio are discarded
+
+punctuation:
+  model: /opt/models/punctuation-restoration-small
+  device: cpu
+  threshold: 0.55
+  workers: 1                 # punctuation threads
+  partial_timeout_ms: 300    # PARTIAL falls back to unpunctuated text after this
+  commit_timeout_ms: 1000    # COMMIT falls back to raw_text after this
+
+semantic:
+  early_commit: false        # optional early commit on a confident terminal mark
+  confidence: 0.90
+  stable_updates: 2

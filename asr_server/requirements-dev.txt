@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8
+# The tests need torch (any build, CPU is enough) for the punctuation and Silero stand-ins.
+# tools/eval (WER client)
+soundfile>=0.12

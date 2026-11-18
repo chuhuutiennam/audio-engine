@@ -1,0 +1,17 @@
+# Runtime dependencies of asr_server.
+#
+# Installed separately with the offline CUDA/Python environment (wheels or container image):
+#   - torch (CUDA build); also used on CPU by Silero VAD and the punctuation model
+#   - vllm[audio]>=0.16.0          for asr.backend: native_vllm (default)
+# Silero VAD loads the local silero_vad.jit with torch.jit.load; no silero-vad
+# package and no onnxruntime are needed.
+numpy>=1.24
+grpcio>=1.60,<2
+protobuf>=4.25,<7
+soxr>=0.5,<2
+transformers>=4.57,<6
+PyYAML>=6
+
+# Only for the alternative backends, not needed by default:
+#   vad.backend: webrtc   ->  webrtcvad-wheels>=2.0.14
+#   asr.backend: qwen_asr ->  qwen-asr[vllm]

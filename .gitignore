@@ -1,0 +1,4 @@
+# Local IDE settings, generated outputs and packaged snapshots
+.idea/
+Claude outputs/
+*.zip

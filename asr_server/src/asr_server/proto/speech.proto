@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+// Gateway (rtpgw, media_ai/internal/ai/proto/speech.proto) <-> ASR engine contract.
+// Tags 1-14 of RecognitionResult are the gateway's. The engine adds tags 20-24; the
+// gateway decodes by tag and skips the ones it does not know. Do not reuse 12-14: the
+// gateway reads them as topic_label / topic_info / topic_score.
+// After editing run: python scripts/build_proto.py
+
+package speech;
+
+service SpeechStream {
+  rpc Recognize(stream AudioChunk) returns (stream RecognitionResult);
+}
+
+message AudioChunk {
+  string session_id     = 1;
+  string stream_id      = 2;
+  bytes  pcm            = 3;
+  int32  sample_rate    = 4;
+  int32  channels       = 5;
+  uint32 rtp_timestamp  = 6;
+  int64  duration_ms    = 7;
+  bool   end_of_stream  = 8;
+  string language       = 9; // speech_to_text: source language (empty = auto). realtime_translation: TARGET language (vi|en); the source is detected
+  string task           = 10; // the gateway sends speech_to_text | realtime_translation | keyword | voice_controller_emoji;
+                              // this engine serves speech_to_text only and ends the others with UNIMPLEMENTED
+  uint32 rtp_clock_rate = 11; // RTP clock Hz (e.g. 8000 for G.711, 0 = infer from sample_rate). int32 in the gateway's file: same wire format
+  int64  chunk_seq      = 12; // monotonic per stream (0-based); a gap means the gateway dropped chunks: logged, processing goes on.
+                              // -1 = not provided. uint64 in the gateway's file: same wire format
+  string language_source = 13; // SOURCE language hint (vi|en); empty = not provided. Used only when asr.use_language_source is on; it overrides `language` for transcribe and fixes the ASR source for translate (empty = auto)
+}
+
+message RecognitionResult {
+  string session_id     = 1;
+  string stream_id      = 2;
+  string text           = 3;
+  bool   is_final       = 4;
+  int64  ts_start       = 5;
+  int64  ts_end         = 6;
+  float  confidence     = 7;
+  string language       = 8;
+  uint64 seq            = 9;
+  bytes  audio_payload  = 10; // G.711 payload bytes; gateway packetizes RTP
+  uint32 audio_pt       = 11; // 0=PCMU, 8=PCMA
+
+  // --- gateway fields for the keyword task; never set by this engine ---
+  TopicLabel topic_label = 12;
+  string     topic_info  = 13;
+  float      topic_score = 14;
+
+  // --- engine extension (tags 20-24) ---
+  uint64       utterance_id = 20; // starts at 1 and advances after each FINAL; all PARTIALs up to a FINAL carry its id.
+                                  // An utterance that ends without a FINAL is cleared by a PARTIAL with empty text,
+                                  // and the next utterance reuses the id.
+  uint32       revision     = 21; // increases with every result of one utterance_id; restarts at 1 after a FINAL
+  string       raw_text     = 22; // ASR text with model markers removed, before punctuation
+  CommitReason reason       = 23; // FINAL only: why the utterance was committed
+  ResultStatus status       = 24; // reserved: always RESULT_STATUS_OK today (a failed utterance produces no FINAL
+                                  // and is logged by the engine)
+}
+
+// Same values as the gateway's enum.
+enum TopicLabel {
+  TOPIC_UNKNOWN = 0;
+  WEATHER       = 1;
+  TRAFFIC       = 2;
+  SPORTS        = 3;
+  FINANCE       = 4;
+  NEWS          = 5;
+  ENTERTAINMENT = 6;
+  HEALTH        = 7;
+  TECHNOLOGY    = 8;
+}
+
+enum CommitReason {
+  COMMIT_REASON_UNSPECIFIED    = 0; // every PARTIAL
+  COMMIT_REASON_SILENCE        = 1; // VAD confirmed enough trailing silence (also: no audio received for
+                                    // server.audio_timeout_ms while an utterance was open)
+  COMMIT_REASON_MAX_DURATION   = 2; // forced split at the maximum utterance length
+  COMMIT_REASON_END_OF_STREAM  = 3; // end_of_stream or client half-close
+  COMMIT_REASON_AUDIO_GAP      = 4; // reserved, not emitted today
+  COMMIT_REASON_SEMANTIC_PAUSE = 5; // optional early commit: short pause + stable text + confident terminal mark
+}
+
+enum ResultStatus {
+  RESULT_STATUS_OK          = 0;
+  RESULT_STATUS_ASR_ERROR   = 1; // reserved
+  RESULT_STATUS_ASR_TIMEOUT = 2; // reserved
+  RESULT_STATUS_OVERLOAD    = 3; // reserved
+}

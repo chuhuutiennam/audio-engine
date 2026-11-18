@@ -1,0 +1,25 @@
+# Python logging.config.dictConfig schema.
+# The log file path is relative to the working directory (bin/start.sh runs from the project root).
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  default:
+    format: "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: default
+    stream: ext://sys.stderr
+  file:
+    class: logging.handlers.TimedRotatingFileHandler
+    formatter: default
+    filename: logs/asr-server.log
+    when: midnight
+    backupCount: 14          # keep 14 days
+    encoding: utf-8
+
+root:
+  level: INFO
+  handlers: [console, file]

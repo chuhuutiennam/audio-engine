@@ -1,0 +1,9 @@
+# Developed on Windows, deployed on Linux: keep LF so bash and python shebangs work.
+*.sh   text eol=lf
+*.sh.example text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.proto text eol=lf

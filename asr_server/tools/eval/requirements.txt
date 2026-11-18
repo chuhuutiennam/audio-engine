@@ -1,0 +1,5 @@
+grpcio>=1.60,<2
+protobuf>=4.25,<7
+numpy>=1.24
+soundfile>=0.12
+soxr>=0.5,<2

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+bin/env.sh
+dist/
+.venv/
+logs/*
+!logs/.gitkeep
+data/*
+!data/.gitkeep
+tools/eval/asr_eval_output/
