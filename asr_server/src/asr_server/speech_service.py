@@ -23,6 +23,7 @@ import grpc
 from . import messages as m
 from .proto import speech_pb2 as pb
 from .proto import speech_pb2_grpc as pb_grpc
+from .word_pacer import WordPacer, paced_transcripts
 
 LOG = logging.getLogger('qwen3_asr.grpc.vad')
 
@@ -113,9 +114,11 @@ class _Stream:
 
 
 class SpeechStreamService(pb_grpc.SpeechStreamServicer):
-    def __init__(self, core, *, use_language_source=False):
+    def __init__(self, core, *, use_language_source=False, word_reveal=None):
+        """`word_reveal`: (window_ms, min_interval_ms) to reveal PARTIALs word by word; None = off."""
         self.core = core
         self.use_language_source = bool(use_language_source)
+        self.word_reveal = word_reveal
 
     # ------------------------------------------------------------------ input
     def _language_code(self, chunk):
@@ -254,8 +257,11 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
                     yield m.StreamRequest(end_stream=m.EndStream())
                     return
 
+        transcripts = self.core.StreamRecognize(requests(), context)
+        if self.word_reveal is not None:
+            transcripts = paced_transcripts(transcripts, WordPacer(*self.word_reveal))
         try:
-            async for transcript in self.core.StreamRecognize(requests(), context):
+            async for transcript in transcripts:
                 yield self._result(holder['stream'], transcript)
         except ProtocolError as exc:
             LOG.warning('protocol error: %s', exc.details)

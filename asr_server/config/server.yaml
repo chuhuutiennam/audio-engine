@@ -50,3 +50,8 @@ semantic:
   early_commit: false        # optional early commit on a confident terminal mark
   confidence: 0.90
   stable_updates: 2
+
+word_reveal:
+  enabled: false             # true: the text of a PARTIAL grows word by word
+  window_ms: 400             # new words are shown within this time; not longer than asr.chunk_sec
+  min_interval_ms: 120       # minimum time between two results sent on a stream

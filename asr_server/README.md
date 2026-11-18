@@ -143,6 +143,25 @@ Cases that produce no FINAL (they are logged, not reported in `status`):
 - No PARTIAL is sent before the utterance has `vad.min_voiced_ms` of voiced
   audio, so an utterance the VAD later discards never shows a PARTIAL.
 
+### Word-by-word reveal (optional)
+
+With `word_reveal.enabled: true`, one PARTIAL of the model is sent as several
+PARTIALs, each carrying one more word. The contract above does not change: every
+PARTIAL is still the entire text to show, and `revision` and `seq` still grow by 1.
+
+- The first new word goes out at once, the others within `word_reveal.window_ms`.
+  Two results are at least `word_reveal.min_interval_ms` apart; when more words
+  wait than fit, they go out in groups.
+- A word the model corrected is replaced at the next send.
+- A FINAL or an empty PARTIAL goes out at once and cancels the words still waiting.
+  The text and timestamps of a FINAL are the same with the reveal on or off; only
+  its `revision` is higher, because more results came before it.
+
+The last word of a PARTIAL reaches the client up to `window_ms` later. With the
+default timing one PARTIAL of the model becomes at most 4 results, so at
+`asr.chunk_sec: 0.5` a stream sends at most 8 results per second. Use it with
+`asr.chunk_sec: 0.5`; `window_ms` must not be longer than `asr.chunk_sec`.
+
 ### Status codes
 
 | Code | When |

@@ -30,7 +30,9 @@ NEW_DEFAULTS = dict(ingress_max_ms=3000, audio_timeout_ms=2000, asr_max_consecut
                     punct_workers=1, punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000,
                     # backend selection; vad_mode only applies to vad.backend = webrtc
                     asr_backend='native_vllm', vad_backend='silero', vad_workers=2, vad_mode=2,
-                    use_language_source=False)
+                    use_language_source=False,
+                    # word-by-word reveal of PARTIAL results, off by default
+                    word_reveal_enabled=False, word_reveal_window_ms=400, word_reveal_min_interval_ms=120)
 ALL_DEFAULTS = {**FORMER_CLI_DEFAULTS, **NEW_DEFAULTS}
 
 
@@ -44,6 +46,14 @@ def test_shipped_server_yaml_equals_defaults():
 
 def test_empty_file_gives_defaults(tmp_path):
     assert load_settings(write(tmp_path, '')) == Settings()
+
+
+def test_word_reveal_is_off_unless_enabled(tmp_path):
+    assert Settings().word_reveal is None
+    path = write(tmp_path, 'asr:\n  chunk_sec: 0.5\nword_reveal:\n  enabled: true\n')
+    assert load_settings(path).word_reveal == (400, 120)
+    path = write(tmp_path, 'word_reveal:\n  enabled: true\n  window_ms: 300\n  min_interval_ms: 100\n')
+    assert load_settings(path).word_reveal == (300, 100)
 
 
 def test_values_and_overrides(tmp_path):
@@ -73,6 +83,13 @@ def test_values_and_overrides(tmp_path):
     'asr:\n  dtype: float64\n',
     'vad:\n  threshold: 1.5\n',
     'vad:\n  threshold: 0.5\n  neg_threshold: 0.7\n',
+    'word_reveal:\n  enabled: 1\n',
+    'word_reveal:\n  window_ms: 0\n',
+    'word_reveal:\n  min_interval_ms: 0\n',
+    'word_reveal:\n  window_ms: 100\n  min_interval_ms: 200\n',
+    'word_reveal:\n  windows_ms: 400\n',
+    # the words of one PARTIAL must be out before the next PARTIAL arrives
+    'asr:\n  chunk_sec: 0.5\nword_reveal:\n  enabled: true\n  window_ms: 600\n',
     '- not\n- a mapping\n',
 ])
 def test_invalid_config_is_rejected(tmp_path, text):

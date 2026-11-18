@@ -201,8 +201,14 @@ Các khóa cần xem khi cài:
 | `server.ingress_max_ms` | `3000` | Chỉ đặt `0` trên server thử khi đo tải bằng `--fast` (mục 10.2). |
 | `asr.partial_max_backlog_ms` | `500` | Audio của một stream chờ quá mức này thì bỏ lần nhận dạng PARTIAL. Chỉ đặt `0` khi đo tải bằng `--fast` (mục 10.2). |
 | `server.max_streams` | `64` | Là giới hạn của gRPC, **không phải** năng lực đã đo. |
+| `asr.chunk_sec` | `1.0` | Đặt `0.5` khi bật hiện từng từ. Lượng audio đưa vào model tăng khoảng 1,8–1,9 lần. |
+| `word_reveal.enabled` | `false` | Đặt `true` để chữ của PARTIAL hiện dần từng từ. |
+| `word_reveal.window_ms` | `400` | Thời gian tối đa để hiện hết các từ mới. Không được lớn hơn `asr.chunk_sec`. |
+| `word_reveal.min_interval_ms` | `120` | Khoảng cách tối thiểu giữa hai kết quả gửi đi trên một stream. |
 
 Các khóa còn lại (VAD, punctuation, semantic) có chú thích ngay trong file; giữ mặc định cho lần chạy đầu.
+
+Bật hiện từng từ: sửa `asr.chunk_sec: 0.5` và `word_reveal.enabled: true` trong `config/server.yaml` của thư mục chạy, rồi chạy `bin/stop.sh` và `bin/start.sh`. `scripts/update.sh` không ghi đè file này. Muốn tắt, đặt lại hai giá trị cũ và khởi động lại.
 
 Log cấu hình ở `config/logging.yaml`: file `logs/asr-server.log`, xoay vòng lúc nửa đêm, giữ 14 ngày. Muốn thấy các dòng `discard` và `empty final text`, đổi `root.level` thành `DEBUG`.
 

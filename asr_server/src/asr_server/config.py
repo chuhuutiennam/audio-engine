@@ -56,6 +56,17 @@ class Settings:
     semantic_early_commit: bool = False
     semantic_confidence: float = 0.90
     stable_updates: int = 2
+    # word-by-word reveal of PARTIAL results
+    word_reveal_enabled: bool = False
+    word_reveal_window_ms: int = 400
+    word_reveal_min_interval_ms: int = 120
+
+    @property
+    def word_reveal(self):
+        """(window_ms, min_interval_ms) when the word-by-word reveal is on, else None."""
+        if not self.word_reveal_enabled:
+            return None
+        return self.word_reveal_window_ms, self.word_reveal_min_interval_ms
 
 
 # (yaml section, yaml key) -> Settings field
@@ -96,6 +107,9 @@ _KEYS = {
     ('semantic', 'early_commit'): 'semantic_early_commit',
     ('semantic', 'confidence'): 'semantic_confidence',
     ('semantic', 'stable_updates'): 'stable_updates',
+    ('word_reveal', 'enabled'): 'word_reveal_enabled',
+    ('word_reveal', 'window_ms'): 'word_reveal_window_ms',
+    ('word_reveal', 'min_interval_ms'): 'word_reveal_min_interval_ms',
 }
 _SECTIONS = sorted({section for section, _ in _KEYS})
 _TYPES = {f.name: f.type for f in fields(Settings)}
@@ -160,6 +174,10 @@ def _validate(s: Settings):
         raise ConfigError('asr.max_consecutive_errors and punctuation.workers must be >= 1')
     if s.punct_partial_timeout_ms < 1 or s.punct_commit_timeout_ms < 1:
         raise ConfigError('punctuation timeouts must be >= 1 ms')
+    if not 1 <= s.word_reveal_min_interval_ms <= s.word_reveal_window_ms:
+        raise ConfigError('require 1 <= word_reveal.min_interval_ms <= word_reveal.window_ms')
+    if s.word_reveal_enabled and s.word_reveal_window_ms > s.chunk_sec * 1000:
+        raise ConfigError('word_reveal.window_ms must not be longer than asr.chunk_sec')
 
 
 def load_settings(path, overrides=None) -> Settings:

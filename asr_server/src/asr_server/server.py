@@ -645,7 +645,10 @@ async def serve(args):
     from .proto import speech_pb2_grpc
     from .speech_service import SpeechStreamService
     speech_pb2_grpc.add_SpeechStreamServicer_to_server(
-        SpeechStreamService(service, use_language_source=args.use_language_source), server)
+        SpeechStreamService(service, use_language_source=args.use_language_source,
+                            word_reveal=args.word_reveal), server)
+    if args.word_reveal:
+        LOG.info('word-by-word reveal on: window=%d ms, min_interval=%d ms', *args.word_reveal)
     addr = f'{args.host}:{args.port}'
     if server.add_insecure_port(addr) == 0:
         raise RuntimeError(f'failed to bind {addr}')
