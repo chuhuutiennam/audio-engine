@@ -161,12 +161,14 @@ copy the missing models, then start with: /u01/ims/audio-engine/bin/start.sh
 
 ### 6.3. Thiết lập riêng của máy
 
-Chỉ cần sửa `/u01/ims/audio-engine/bin/env.sh` khi Python không phải `python3` mặc định, hoặc khi cần chọn GPU:
+Lần cài đầu, `/u01/ims/audio-engine/bin/env.sh` được tạo sẵn với các biến chạy offline và `CUDA_VISIBLE_DEVICES=0`. Chỉ cần sửa file này khi Python không phải `python3` mặc định, hoặc khi cần chọn GPU khác:
 
 ```bash
 PYTHON=/duong/dan/toi/venv/bin/python
 export CUDA_VISIBLE_DEVICES=0
 ```
+
+Máy đã cài từ trước vẫn giữ `bin/env.sh` cũ. Sau khi cập nhật, so sánh với `bin/env.sh.example` rồi thêm các dòng còn thiếu.
 
 ### 6.4. Kiểm tra lại
 

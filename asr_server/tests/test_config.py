@@ -48,6 +48,16 @@ def test_empty_file_gives_defaults(tmp_path):
     assert load_settings(write(tmp_path, '')) == Settings()
 
 
+def test_env_example_sets_the_offline_runtime_variables():
+    lines = (ROOT / 'bin' / 'env.sh.example').read_text(encoding='utf-8').splitlines()
+    exported = dict(line[len('export '):].split('=', 1) for line in lines if line.startswith('export '))
+    assert exported == {
+        'PIP_NO_INDEX': '1', 'PIP_DISABLE_PIP_VERSION_CHECK': '1', 'HF_HUB_OFFLINE': '1',
+        'TRANSFORMERS_OFFLINE': '1', 'HF_DATASETS_OFFLINE': '1', 'HF_HUB_DISABLE_TELEMETRY': '1',
+        'TOKENIZERS_PARALLELISM': 'false', 'VLLM_WORKER_MULTIPROC_METHOD': 'spawn',
+        'CUDA_VISIBLE_DEVICES': '0'}
+
+
 def test_word_reveal_is_off_unless_enabled(tmp_path):
     assert Settings().word_reveal is None
     path = write(tmp_path, 'asr:\n  chunk_sec: 0.5\nword_reveal:\n  enabled: true\n')
