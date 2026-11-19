@@ -47,3 +47,16 @@ def split_asr_output(raw: str):
     if language and language.lower() == "none":
         language = None
     return language, strip_asr_markers(raw)
+
+
+# Unicode script Han: radicals, ideographic marks and numerals, extension A, main block,
+# compatibility block, extensions B and later.
+_HAN = re.compile(
+    "[⺀-⺙⺛-⻳⼀-⿕々〇〡-〩〸-〻"
+    "㐀-䶿一-鿿豈-﫿\U00020000-\U0003ffff]"
+)
+
+
+def count_han(text: str) -> int:
+    """Number of Han characters in `text`; Chinese punctuation is not counted."""
+    return len(_HAN.findall(text or ""))

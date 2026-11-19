@@ -204,6 +204,7 @@ Các khóa cần xem khi cài:
 | `asr.partial_max_backlog_ms` | `500` | Audio của một stream chờ quá mức này thì bỏ lần nhận dạng PARTIAL. Chỉ đặt `0` khi đo tải bằng `--fast` (mục 10.2). |
 | `server.max_streams` | `64` | Là giới hạn của gRPC, **không phải** năng lực đã đo. |
 | `asr.chunk_sec` | `1.0` | Đặt `0.5` khi bật hiện từng từ. Lượng audio đưa vào model tăng khoảng 1,8–1,9 lần. |
+| `asr.log_results` | `false` | Đặt `true` để ghi ngôn ngữ và text của từng PARTIAL, COMMIT vào log (mục 12.1). Chỉ bật trong lúc phân tích: log chứa nội dung cuộc gọi, và các file đã ghi vẫn còn trên đĩa tối đa 14 ngày sau khi tắt cờ. |
 | `word_reveal.enabled` | `false` | Đặt `true` để chữ của PARTIAL hiện dần từng từ. |
 | `word_reveal.window_ms` | `400` | Thời gian tối đa để hiện hết các từ mới. Không được lớn hơn `asr.chunk_sec`. |
 | `word_reveal.min_interval_ms` | `120` | Khoảng cách tối thiểu giữa hai kết quả gửi đi trên một stream. |
@@ -400,6 +401,21 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 | `rtp_timestamp jump ... chunk_seq=...: expected ..., got ...` | WARNING | `rtp_timestamp` của chunk không nối tiếp audio đã nhận; từ chunk đó `ts_start`/`ts_end` tính theo giá trị mới. Ghi 3 lần đầu của mỗi stream, sau đó mỗi 500 lần. |
 | `model reported language ...` | WARNING | Model báo ngôn ngữ ngoài `vi`/`en`; `language` để rỗng. |
 | `punctuation not ready after ... ms; using raw text` | WARNING | Punctuation quá hạn; kết quả dùng text chưa có dấu câu. |
+| `asr_result call=... leg=... utterance=... revision=... event=... language=... han_chars=N model_output=... raw=... text=...` | INFO | Chỉ có khi `asr.log_results: true`. Mỗi PARTIAL và COMMIT server tạo ra một dòng, ghi trước bước hiện từng từ. Câu trả lời của model không đổi text thì không tạo kết quả nên không có dòng này. |
+
+Các trường của dòng `asr_result`:
+
+- `revision`: số thứ tự trong server. Khi bật hiện từng từ, số này khác `revision` mà client nhận.
+- `language`: ngôn ngữ server đang dùng cho câu đó.
+- `han_chars`: số chữ Hán trong `raw`.
+- `model_output`: câu trả lời gốc của model, còn nguyên marker ngôn ngữ. Trường này rỗng khi model lỗi, hoặc khi dùng `asr.backend: qwen_asr`.
+- `raw`, `text`: text trước và sau punctuation.
+
+Tìm các kết quả có chữ Hán, gồm cả các file log đã xoay vòng:
+
+```bash
+grep -h 'asr_result' logs/asr-server.log* | grep -v 'han_chars=0 '
+```
 
 ### 12.2. Sự cố
 

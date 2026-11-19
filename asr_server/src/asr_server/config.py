@@ -35,6 +35,7 @@ class Settings:
     asr_max_consecutive_errors: int = 3
     partial_max_backlog_ms: int = 500         # 0 = never skip a PARTIAL inference
     use_language_source: bool = False         # read AudioChunk.language_source
+    asr_log_results: bool = False             # log language and text of every PARTIAL and COMMIT
     # vad
     vad_backend: str = 'silero'               # silero | webrtc
     silero_model: str = '/opt/models/silero_vad.jit'
@@ -89,6 +90,7 @@ _KEYS = {
     ('asr', 'max_consecutive_errors'): 'asr_max_consecutive_errors',
     ('asr', 'partial_max_backlog_ms'): 'partial_max_backlog_ms',
     ('asr', 'use_language_source'): 'use_language_source',
+    ('asr', 'log_results'): 'asr_log_results',
     ('vad', 'backend'): 'vad_backend',
     ('vad', 'silero_model'): 'silero_model',
     ('vad', 'threshold'): 'vad_threshold',

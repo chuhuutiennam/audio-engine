@@ -31,6 +31,8 @@ NEW_DEFAULTS = dict(ingress_max_ms=3000, audio_timeout_ms=2000, asr_max_consecut
                     # backend selection; vad_mode only applies to vad.backend = webrtc
                     asr_backend='native_vllm', vad_backend='silero', vad_workers=2, vad_mode=2,
                     use_language_source=False,
+                    # the text of the calls stays out of the log unless asked for
+                    asr_log_results=False,
                     # word-by-word reveal of PARTIAL results, off by default
                     word_reveal_enabled=False, word_reveal_window_ms=400, word_reveal_min_interval_ms=120)
 ALL_DEFAULTS = {**FORMER_CLI_DEFAULTS, **NEW_DEFAULTS}
@@ -66,6 +68,10 @@ def test_word_reveal_is_off_unless_enabled(tmp_path):
     assert load_settings(path).word_reveal == (300, 100)
 
 
+def test_log_results_is_read_from_the_asr_section(tmp_path):
+    assert load_settings(write(tmp_path, 'asr:\n  log_results: true\n')).asr_log_results is True
+
+
 def test_values_and_overrides(tmp_path):
     path = write(tmp_path, 'server:\n  port: 6000\nasr:\n  chunk_sec: 2\nsemantic:\n  early_commit: true\n')
     s = load_settings(path)
@@ -91,6 +97,7 @@ def test_values_and_overrides(tmp_path):
     'asr:\n  backend: whisper\n',
     'vad:\n  backend: energy\n',
     'asr:\n  dtype: float64\n',
+    'asr:\n  log_results: 1\n',
     'vad:\n  threshold: 1.5\n',
     'vad:\n  threshold: 0.5\n  neg_threshold: 0.7\n',
     'word_reveal:\n  enabled: 1\n',

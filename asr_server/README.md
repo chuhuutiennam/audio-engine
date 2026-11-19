@@ -328,6 +328,11 @@ Logs: `logs/asr-server.log`, rotated at midnight, 14 days kept
 (`config/logging.yaml`). When started through `bin/start.sh`, anything printed
 outside the logging system goes to `logs/asr-server.out`, which is not rotated.
 
+With `asr.log_results: true`, every PARTIAL and COMMIT of the model adds one INFO
+line `asr_result` with the language, the number of Han characters, the model answer
+and the text before and after punctuation. It is off by default because the log
+then holds the content of the calls.
+
 Optional early semantic commits (higher risk of over-segmentation), in
 `config/server.yaml`:
 

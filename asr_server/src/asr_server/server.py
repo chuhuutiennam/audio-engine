@@ -33,7 +33,7 @@ import numpy as np
 from . import messages as pb
 from .audio import PCM16kConverter, decode_audio
 from .punctuation import HFPunctuator, IdentityPunctuator, PunctResult
-from .text_clean import strip_asr_markers
+from .text_clean import count_han, strip_asr_markers
 from .vad import SileroEndpointer, WebRTCEndpointer
 
 LOG = logging.getLogger('qwen3_asr.grpc.vad')
@@ -94,7 +94,8 @@ class ASRService:
                  ingress_max_ms=3000, audio_timeout_ms=2000,
                  partial_max_backlog_ms=500,
                  max_consecutive_errors=3, punct_workers=1,
-                 punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000):
+                 punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000,
+                 log_results=False):
         if not 0.2 <= chunk_sec < max_utterance_sec:
             raise ValueError('require 0.2 <= chunk_sec < max_utterance_sec')
         self.asr = model
@@ -126,6 +127,7 @@ class ASRService:
         self.max_consecutive_errors = int(max_consecutive_errors)
         self.punct_partial_timeout_ms = int(punct_partial_timeout_ms)
         self.punct_commit_timeout_ms = int(punct_commit_timeout_ms)
+        self.log_results = bool(log_results)
         self.infer_worker = InferWorker()
         self.punct_pool = ThreadPoolExecutor(max_workers=max(1, int(punct_workers)),
                                              thread_name_prefix='punct')
@@ -237,8 +239,17 @@ class ASRService:
             """Language of the open utterance: what the model reports, else what the client asked for."""
             return (asr_state.language if asr_state is not None else '') or cfg.language or ''
 
-        def make_event(kind, text, raw_text, reason, end_ms):
+        def make_event(kind, text, raw_text, reason, end_ms, answered=True):
+            """`answered` is False when the model failed: its last answer says nothing about this event."""
             language = utterance_language()
+            if self.log_results:
+                # %r keeps a line break of the model on one log line.
+                LOG.info('asr_result call=%s leg=%s utterance=%s revision=%s event=%s language=%s '
+                         'han_chars=%d model_output=%r raw=%r text=%r',
+                         cfg.call_id, cfg.leg_id, utterance_index, revision,
+                         'COMMIT' if kind == pb.COMMIT else 'PARTIAL', language,
+                         count_han(raw_text),
+                         getattr(asr_state, 'raw_output', '') if answered else '', raw_text, text)
             return pb.Transcript(
                 call_id=cfg.call_id, leg_id=cfg.leg_id,
                 utterance_index=utterance_index, text=text,
@@ -249,12 +260,12 @@ class ASRService:
                 start_ms=max(0, current_start_ms), end_ms=max(0, int(end_ms)),
             )
 
-        def clear_partial(end_ms):
+        def clear_partial(end_ms, answered=True):
             """Empty PARTIAL: tells the client to drop the text shown for this utterance."""
             nonlocal revision, partial_sent
             revision += 1
             partial_sent = False
-            return make_event(pb.PARTIAL, '', '', 'partial', end_ms)
+            return make_event(pb.PARTIAL, '', '', 'partial', end_ms, answered)
 
         async def infer(fn, *args):
             """Run a model call on the inference worker; AsrFailure if the model raised."""
@@ -378,7 +389,7 @@ class ASRService:
             nonlocal asr_state, skip_until_endpoint
             LOG.error('asr error call=%s leg=%s utterance=%s consecutive=%d: %s',
                       cfg.call_id, cfg.leg_id, utterance_index, consecutive_errors, exc)
-            out = [clear_partial(end_ms)] if partial_sent else []
+            out = [clear_partial(end_ms, answered=False)] if partial_sent else []
             asr_state = None
             skip_until_endpoint = bool(vad.active)
             if consecutive_errors >= self.max_consecutive_errors:
@@ -619,6 +630,8 @@ async def serve(args):
     LOG.info('loading punctuation model: %s', args.punct_model)
     punctuator = HFPunctuator(args.punct_model, device=args.punct_device,
                               threshold=args.punct_threshold)
+    if args.asr_log_results:
+        LOG.warning('asr.log_results is on: the text of every call is written to the log')
     service = ASRService(
         asr, punctuator, chunk_sec=args.chunk_sec,
         max_utterance_sec=args.max_utterance_sec,
@@ -636,7 +649,8 @@ async def serve(args):
         max_consecutive_errors=args.asr_max_consecutive_errors,
         punct_workers=args.punct_workers,
         punct_partial_timeout_ms=args.punct_partial_timeout_ms,
-        punct_commit_timeout_ms=args.punct_commit_timeout_ms)
+        punct_commit_timeout_ms=args.punct_commit_timeout_ms,
+        log_results=args.asr_log_results)
     server = grpc.aio.server(
         maximum_concurrent_rpcs=args.max_streams,
         options=[('grpc.max_receive_message_length', 2 * 1024 * 1024),

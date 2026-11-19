@@ -26,6 +26,8 @@ asr:
                              # inference and keep the audio for the next one. A FINAL is always
                              # inferred. 0 = never skip (use it for --fast throughput measurements)
   use_language_source: false # true: AudioChunk.language_source overrides AudioChunk.language
+  log_results: false         # true: one INFO line per PARTIAL and COMMIT with the language, the model
+                             # answer and the text. The log then holds the content of the calls
 
 vad:
   backend: silero            # silero | webrtc
