@@ -223,26 +223,36 @@ installs it into a run directory (default `/u01/ims/audio-engine`, or
 ```text
 <app home>/
 ├── bin/      start.sh stop.sh status.sh   replaced on every update
+│             rollback.sh wait_ready.sh _upgrade.sh   replaced on every update, kept by a rollback
 │             env.sh                        local settings (PYTHON, CUDA_VISIBLE_DEVICES); created once
 ├── config/   server.yaml logging.yaml      created once, never overwritten
 │             *.dist                        defaults of the installed version
 ├── lib/      asr_server/                   application code, replaced on every update
-│             asr_server.prev/              the version before, for rollback
+│             asr_server.prev/              the version before
+├── backup/   <date>-<time>/                replaced versions (code, bin, config), last 10 kept
+│             rolled-back/<date>-<time>/    versions replaced by a rollback, last 10 kept
 ├── logs/  model/  data/                    never touched
 └── VERSION
 ```
 
 ```bash
 bash scripts/update.sh              # build (scripts/build.sh), then install or update
-bash scripts/update.sh --restart    # same, stopping and restarting a running server
+bash scripts/update.sh --restart    # same, restarting the server and waiting until it is ready
 bash scripts/build.sh --test        # run the tests, then build into build/app
+<app home>/bin/rollback.sh --list   # show the saved versions
+<app home>/bin/rollback.sh [ID]     # go back to a saved version
 ```
 
 - On the first install the model paths of `config/server.yaml` are set to
   `<app home>/model/...`; missing model files are reported.
 - An update validates the configuration found in the run directory against the
-  new code first. If it is not valid, or the server is running and `--restart`
-  was not given, nothing is changed.
+  new code and the installed code first. If it is not valid, or the server is
+  running and `--restart` was not given, nothing is changed. Add the keys of a
+  new version after the update.
+- A server that dies or does not open its port within `ASR_START_WAIT_SEC`
+  seconds (default 300) is reported with exit code 1 and is **not** rolled back,
+  so that the logs can be examined first.
+- `ASR_BACKUP_KEEP` and `ASR_START_WAIT_SEC` are read from `bin/env.sh`.
 - `bin/*.sh` are the same scripts in both places: they use `lib/` when it
   exists and `src/` otherwise, and read `bin/env.sh` when it exists.
 

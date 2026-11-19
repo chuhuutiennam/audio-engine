@@ -43,11 +43,14 @@ Không cần: `qwen-asr`, `webrtcvad`, `onnxruntime`, gói Python `silero-vad`, 
 | Thư mục / file | Nội dung | Khi cập nhật |
 |---|---|---|
 | `bin/start.sh`, `stop.sh`, `status.sh` | Script chạy, dừng, xem trạng thái | Thay bằng bản mới |
+| `bin/rollback.sh`, `wait_ready.sh`, `_upgrade.sh` | Quay lại phiên bản đã lưu, chờ server sẵn sàng | Thay bằng bản mới; rollback không đưa các file này về bản cũ |
 | `bin/env.sh` | Thiết lập riêng của máy: đường dẫn Python, GPU | Tạo một lần, **không ghi đè** |
 | `config/server.yaml`, `logging.yaml` | Cấu hình đang dùng | Tạo một lần, **không ghi đè** |
 | `config/*.dist` | Cấu hình mặc định của phiên bản vừa cài, để so sánh | Thay bằng bản mới |
 | `lib/asr_server/` | Mã của ứng dụng | Thay bằng bản mới |
-| `lib/asr_server.prev/` | Mã của phiên bản ngay trước, để quay lại | Thay bằng bản vừa bị thay |
+| `lib/asr_server.prev/` | Mã của phiên bản ngay trước, để đối chiếu | Thay bằng bản vừa bị thay |
+| `backup/<ngày>-<giờ>/` | Các phiên bản đã bị thay: mã, `bin/`, `config/`, `VERSION` | Thêm một bản, giữ tối đa 10 bản |
+| `backup/rolled-back/<ngày>-<giờ>/` | Các phiên bản bị thay khi rollback, để xem lại | Thêm một bản mỗi lần rollback, giữ tối đa 10 bản |
 | `logs/` | Log, file pid | Không đụng tới |
 | `model/` | Ba model | Không đụng tới |
 | `data/` | File audio thử, kết quả đo | Không đụng tới |
@@ -357,28 +360,54 @@ cd /u01/ims/namcht/audio-engine/asr_server
 bash scripts/update.sh --restart
 ```
 
-`--restart` dừng server, thay mã, rồi chạy lại. Các stream đang mở bị rớt; Gateway phải mở lại stream. Không có `--restart` mà server đang chạy thì `update.sh` từ chối và không đổi gì.
+`--restart` dừng server, thay mã, chạy lại rồi chờ server sẵn sàng. Các stream đang mở bị rớt; Gateway phải mở lại stream. Server đang dừng thì `--restart` cũng chạy server, trừ khi còn thiếu model. Không có `--restart` mà server đang chạy thì `update.sh` từ chối và không đổi gì.
 
 Thứ tự `update.sh` thực hiện:
 
 1. Build từ source.
-2. Kiểm tra cấu hình đang dùng trong APP bằng mã **mới**. Không hợp lệ (ví dụ phiên bản mới bỏ một khóa) thì dừng: báo lỗi, mã cũ còn nguyên, server không bị dừng. So `config/server.yaml` với `config/server.yaml.dist` để sửa rồi chạy lại.
-3. Dừng server (khi có `--restart`).
-4. Thay `lib/asr_server` và các script trong `bin/`; bản cũ chuyển thành `lib/asr_server.prev`.
-5. Chạy lại server (khi có `--restart`).
+2. Kiểm tra cấu hình đang dùng trong APP bằng mã **mới**. Không hợp lệ (ví dụ phiên bản mới bỏ một khóa) thì dừng: báo lỗi, mã cũ còn nguyên, server không bị dừng. So `config/server.yaml` với `config/server.yaml.dist.new` để sửa rồi chạy lại.
+3. Kiểm tra cấu hình đó bằng mã **đang cài**. Không hợp lệ thì dừng như trên, vì bản lưu sẽ không rollback được.
+4. Lưu phiên bản đang cài vào `backup/<ngày>-<giờ>/`, xóa các bản cũ vượt quá 10 bản. Bản gần nhất chạy tốt luôn được giữ lại, kể cả sau nhiều lần nâng cấp lỗi liên tiếp.
+5. Dừng server (khi có `--restart`).
+6. Thay `lib/asr_server` và các script trong `bin/`; bản cũ chuyển thành `lib/asr_server.prev`.
+7. Chạy lại server và chờ cổng gRPC mở (khi có `--restart`). Cổng chỉ mở sau khi nạp xong model.
 
 `config/server.yaml`, `config/logging.yaml`, `bin/env.sh`, `logs/`, `model/`, `data/` không bị đụng tới. Khóa cấu hình mới của phiên bản mới nhận giá trị mặc định; xem trong `config/server.yaml.dist`.
 
-**Quay lại phiên bản trước:**
+**Khóa cấu hình mới phải thêm sau khi nâng cấp xong.** Thêm trước thì bước 3 báo `unknown key` và dừng. Nếu mã đang cài bị hỏng nên không đọc được cấu hình, thêm `--ignore-old-config` để vẫn nâng cấp; bản lưu lần đó được đánh dấu `failed` và `rollback.sh` mặc định bỏ qua nó.
+
+**Khi nâng cấp lỗi:** `update.sh` báo `did not become ready; it was NOT rolled back` và trả mã thoát 1. Script **không tự rollback**, để bạn xem log trước:
+
+```bash
+tail -n 100 /u01/ims/audio-engine/logs/asr-server.log
+tail -n 100 /u01/ims/audio-engine/logs/asr-server.out
+```
+
+Server chưa mở cổng sau thời gian chờ vẫn được giữ chạy. Kiểm tra lại bằng `bin/wait_ready.sh`.
+
+**Quay lại phiên bản đã lưu:**
 
 ```bash
 cd /u01/ims/audio-engine
-bin/stop.sh
-mv lib/asr_server lib/asr_server.bad && mv lib/asr_server.prev lib/asr_server
-bin/start.sh
+bin/rollback.sh --list                # xem các bản đã lưu
+bin/rollback.sh                       # về bản đánh dấu "<- default"
+bin/rollback.sh 20261119-103000       # về bản chỉ định
 ```
 
-Chỉ giữ một phiên bản trước. `bin/` không được quay lại theo; nếu cần, cài lại từ source của phiên bản cũ.
+- Bản mặc định là bản mới nhất có `health=ok`. Nếu không có bản nào như vậy, script chọn bản mới nhất chưa có kết quả kiểm tra. Bản `failed` không bao giờ được chọn tự động. Muốn về bản khác, ghi rõ tên bản.
+- `rollback.sh` khôi phục mã, `bin/`, `config/`, `VERSION`, chạy lại server và chờ server sẵn sàng.
+- Phiên bản vừa bị thay, gồm mã và cấu hình, được giữ ở `backup/rolled-back/<ngày>-<giờ>/` để xem lại.
+- Cấu hình đã lưu không hợp lệ với mã đã lưu thì script dừng và không đổi gì.
+- Không quay lại được gói Python và model.
+
+Thiết lập trong `bin/env.sh`:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `ASR_BACKUP_KEEP` | `10` | Số phiên bản giữ trong `backup/`, tối thiểu 1 |
+| `ASR_START_WAIT_SEC` | `300` | Số giây chờ server sẵn sàng sau khi chạy lại. Đặt lớn hơn thời gian nạp model thật. `0` là chỉ kiểm tra tiến trình còn sống |
+
+Kiểm tra này chỉ phát hiện server chết hoặc không mở cổng. Lỗi nhận dạng sai text phải tự phát hiện rồi chạy `rollback.sh`.
 
 Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yaml`, chạy `--check-config` (mục 7), rồi `bin/stop.sh && bin/start.sh`.
 
@@ -421,9 +450,12 @@ grep -h 'asr_result' logs/asr-server.log* | grep -v 'han_chars=0 '
 
 | Hiện tượng | Nguyên nhân | Xử lý |
 |---|---|---|
-| `update.sh`: `the configuration in ... is not valid for this version` | Cấu hình trong APP có khóa lạ hoặc giá trị sai với mã mới | Sửa theo thông báo, so với `config/server.yaml.dist`, chạy lại `update.sh`. |
+| `update.sh`: `the configuration in ... is not valid for this version` | Cấu hình trong APP có khóa lạ hoặc giá trị sai với mã mới | Sửa theo thông báo, so với `config/server.yaml.dist.new`, chạy lại `update.sh`. |
 | `update.sh`: `asr_server is running in ...` | Server đang chạy | Thêm `--restart`, hoặc `bin/stop.sh` trước. |
 | `update.sh`: `Permission denied` | User không có quyền ghi vào APP | Chạy bằng user chạy app. |
+| `update.sh`: `the installed version cannot read ...` | Đã thêm khóa của phiên bản mới trước khi nâng cấp | Bỏ khóa đó, chạy lại `update.sh --restart`, rồi thêm lại khóa và khởi động lại. |
+| `update.sh`: `did not become ready; it was NOT rolled back` | Server chết hoặc chưa mở cổng sau `ASR_START_WAIT_SEC` giây | Xem `logs/asr-server.log` và `logs/asr-server.out`. Sửa lỗi rồi nâng cấp lại, hoặc chạy `bin/rollback.sh`. |
+| `rollback.sh`: `the saved configuration of ... is not valid` | Cấu hình trong bản lưu không hợp lệ với mã của bản đó | Chọn bản khác trong `bin/rollback.sh --list`. |
 | `configuration error: ...`, mã thoát 2 | Khóa lạ hoặc giá trị sai trong YAML | Sửa theo thông báo, chạy lại `--check-config`. |
 | `missing local ASR checkpoint` / `punctuation checkpoint` / `Silero VAD checkpoint` | Thiếu model hoặc sai đường dẫn | Kiểm tra `APP/model` và ba khóa đường dẫn model. |
 | `asr_server exited during startup; see .../logs/asr-server.out` | Lỗi khi khởi động | Đọc `logs/asr-server.out`; chạy lại ở tiền cảnh (mục 8.1). |

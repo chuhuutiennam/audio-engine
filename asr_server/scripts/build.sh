@@ -35,7 +35,9 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/config"
 cp -R "$ROOT/src/asr_server" "$STAGE/lib/asr_server"
 find "$STAGE/lib" -name '__pycache__' -type d -prune -exec rm -rf {} +
-for name in _common.sh start.sh stop.sh status.sh env.sh.example; do
+# shellcheck disable=SC1091
+source "$ROOT/bin/_upgrade.sh"
+for name in $BIN_SCRIPTS; do
   cp "$ROOT/bin/$name" "$STAGE/bin/$name"
 done
 chmod +x "$STAGE"/bin/*.sh
