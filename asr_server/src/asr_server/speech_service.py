@@ -35,6 +35,7 @@ ANCHOR_HISTORY_MS = 60000
 # speech.proto language code <-> language name used by the model
 LANGUAGE_NAMES = {'vi': 'Vietnamese', 'en': 'English'}
 LANGUAGE_CODES = {name.lower(): code for code, name in LANGUAGE_NAMES.items()}
+AUTO_CODE = 'auto'      # the model detects the language; never sent back to the client
 
 SUPPORTED_TASKS = ('', 'speech_to_text')
 # Tasks the gateway may route here that this engine does not implement.
@@ -143,7 +144,7 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
             raise ProtocolError(grpc.StatusCode.INVALID_ARGUMENT,
                                 f'pcm must be mono, got channels={chunk.channels}')
         code = self._language_code(chunk)
-        if code and code not in LANGUAGE_NAMES:
+        if code and code != AUTO_CODE and code not in LANGUAGE_NAMES:
             LOG.warning('unknown language code %r session=%s stream=%s; using the server default',
                         code, chunk.session_id, chunk.stream_id)
         stream = _Stream(chunk, code)
@@ -246,7 +247,8 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
                     yield m.StreamRequest(config=m.StreamConfig(
                         call_id=stream.session_id, leg_id=stream.stream_id,
                         encoding=m.PCM_S16LE, sample_rate=stream.sample_rate,
-                        language=LANGUAGE_NAMES.get(stream.language_code, '')))
+                        language=(m.AUTO_LANGUAGE if stream.language_code == AUTO_CODE
+                                  else LANGUAGE_NAMES.get(stream.language_code, ''))))
                 else:
                     self._check(stream, chunk)
                 self._accept(stream, chunk)

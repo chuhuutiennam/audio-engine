@@ -31,6 +31,8 @@ NEW_DEFAULTS = dict(ingress_max_ms=3000, audio_timeout_ms=2000, asr_max_consecut
                     # backend selection; vad_mode only applies to vad.backend = webrtc
                     asr_backend='native_vllm', vad_backend='silero', vad_workers=2, vad_mode=2,
                     use_language_source=False,
+                    # language of a stream that names none (was fixed to Vietnamese); not forced
+                    default_language='vi', force_language=False,
                     # the text of the calls stays out of the log unless asked for
                     asr_log_results=False,
                     # word-by-word reveal of PARTIAL results, off by default
@@ -72,6 +74,12 @@ def test_log_results_is_read_from_the_asr_section(tmp_path):
     assert load_settings(write(tmp_path, 'asr:\n  log_results: true\n')).asr_log_results is True
 
 
+@pytest.mark.parametrize('code', ['vi', 'en', 'auto'])
+def test_language_settings_are_read_from_the_asr_section(tmp_path, code):
+    s = load_settings(write(tmp_path, f'asr:\n  default_language: {code}\n  force_language: true\n'))
+    assert (s.default_language, s.force_language) == (code, True)
+
+
 def test_values_and_overrides(tmp_path):
     path = write(tmp_path, 'server:\n  port: 6000\nasr:\n  chunk_sec: 2\nsemantic:\n  early_commit: true\n')
     s = load_settings(path)
@@ -98,6 +106,11 @@ def test_values_and_overrides(tmp_path):
     'vad:\n  backend: energy\n',
     'asr:\n  dtype: float64\n',
     'asr:\n  log_results: 1\n',
+    'asr:\n  default_language: fr\n',         # vi | en | auto only
+    'asr:\n  default_language: Vietnamese\n', # the speech.proto code, not the model name
+    'asr:\n  default_language: VI\n',
+    'asr:\n  default_language: ""\n',
+    'asr:\n  force_language: 1\n',
     'vad:\n  threshold: 1.5\n',
     'vad:\n  threshold: 0.5\n  neg_threshold: 0.7\n',
     'word_reveal:\n  enabled: 1\n',
@@ -168,6 +181,15 @@ def test_no_console_drops_only_console_handler(tmp_path, monkeypatch):
                 handler.close()
         root.handlers[:] = saved[0]
         root.setLevel(saved[1])
+
+
+def test_optional_setting_does_not_depend_on_the_typing_cache(tmp_path):
+    # Imports can push Optional[float] out of typing's cache; an identity check then failed
+    # with "vad_neg_threshold: expected a non-empty string, got 0.3".
+    import typing
+    for clear in typing._cleanups:
+        clear()
+    assert load_settings(write(tmp_path, 'vad:\n  neg_threshold: 0.3\n')).vad_neg_threshold == 0.3
 
 
 def test_backend_selection_and_optional_neg_threshold(tmp_path):

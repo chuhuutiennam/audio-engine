@@ -453,6 +453,7 @@ Trong đó `T_GPU` là thông lượng đo được của ASR Service (giây aud
 ### 6.7. Ngôn ngữ và context
 
 - Ánh xạ mã proto sang tên model dùng: `vi → Vietnamese`, `en → English`. Rỗng → `asr.default_language`; server hiện có ép `Vietnamese`, để trống cấu hình này thì model tự nhận diện.
+  - *Đã hiện thực (21/11/2026), khác đề xuất trên:* `asr.default_language` nhận mã proto `vi`, `en` hoặc `auto` (model tự nhận diện), mặc định `vi`; việc ép là khóa riêng `asr.force_language` (mặc định `false`). Xem `asr_server/README.md`, đoạn "Language" trong mục "Processing".
 - Khi Gateway biết ngôn ngữ thì nên ép; nhận diện tự động trên utterance ngắn băng hẹp kém ổn định.
 - `asr.context`: danh sách thuật ngữ miền (tên gói cước, thương hiệu, địa danh) đưa vào mọi request. Cấu hình theo triển khai, không lấy từ proto.
 

@@ -208,6 +208,8 @@ Các khóa cần xem khi cài:
 | `server.max_streams` | `64` | Là giới hạn của gRPC, **không phải** năng lực đã đo. |
 | `asr.chunk_sec` | `1.0` | Đặt `0.5` khi bật hiện từng từ. Lượng audio đưa vào model tăng khoảng 1,8–1,9 lần. |
 | `asr.log_results` | `false` | Đặt `true` để ghi ngôn ngữ và text của từng PARTIAL, COMMIT vào log (mục 12.1). Chỉ bật trong lúc phân tích: log chứa nội dung cuộc gọi, và các file đã ghi vẫn còn trên đĩa tối đa 14 ngày sau khi tắt cờ. |
+| `asr.default_language` | `vi` | Ngôn ngữ của stream khi rtpgw không gửi `language` hoặc gửi mã lạ: `vi`, `en` hoặc `auto` (model tự đoán). Thay cho giá trị `Vietnamese` viết cứng trước đây. |
+| `asr.force_language` | `false` | Đặt `true` để ép model nhận dạng theo ngôn ngữ của stream (`vi`, `en`) thay vì tự đoán; stream `auto` vẫn tự đoán. Chỉ áp dụng cho `asr.backend: native_vllm`. Thư mục model phải có chat template (`chat_template.json`, `chat_template.jinja` hoặc trong `tokenizer_config.json`), thiếu thì server không khởi động. |
 | `word_reveal.enabled` | `false` | Đặt `true` để chữ của PARTIAL hiện dần từng từ. |
 | `word_reveal.window_ms` | `400` | Thời gian tối đa để hiện hết các từ mới. Không được lớn hơn `asr.chunk_sec`. |
 | `word_reveal.min_interval_ms` | `120` | Khoảng cách tối thiểu giữa hai kết quả gửi đi trên một stream. |
@@ -215,6 +217,14 @@ Các khóa cần xem khi cài:
 Các khóa còn lại (VAD, punctuation, semantic) có chú thích ngay trong file; giữ mặc định cho lần chạy đầu.
 
 Bật hiện từng từ: sửa `asr.chunk_sec: 0.5` và `word_reveal.enabled: true` trong `config/server.yaml` của thư mục chạy, rồi chạy `bin/stop.sh` và `bin/start.sh`. `scripts/update.sh` không ghi đè file này. Muốn tắt, đặt lại hai giá trị cũ và khởi động lại.
+
+Bật ép ngôn ngữ: **sau khi** nâng cấp xong (code cũ từ chối khóa lạ), thêm `force_language: true` vào mục `asr` của `config/server.yaml` ở thư mục chạy, đổi `default_language` nếu cần, rồi chạy `bin/stop.sh` và `bin/start.sh`. Kiểm tra trong `logs/asr-server.log`:
+
+1. Có dòng `asr.force_language on`.
+2. Sau cuộc gọi đầu tiên có dòng `model prompt language=Vietnamese ends with '...<|im_start|>assistant\nlanguage Vietnamese<asr_text>'`.
+3. Các stream rtpgw gửi `vi` không còn dòng `model reported language`. Với `asr.log_results: true`, `model_output` không còn bắt đầu bằng `language ...<asr_text>`.
+
+Muốn tắt, đặt lại `force_language: false` và khởi động lại.
 
 Log cấu hình ở `config/logging.yaml`: file `logs/asr-server.log`, xoay vòng lúc nửa đêm, giữ 14 ngày. Muốn thấy các dòng `discard` và `empty final text`, đổi `root.level` thành `DEBUG`.
 
@@ -419,7 +429,9 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 
 | Dòng log | Mức | Ý nghĩa |
 |---|---|---|
-| `start call=... leg=... rate=...` | INFO | Một stream mới. |
+| `start call=... leg=... rate=... codec=... language=...` | INFO | Một stream mới. `language`: ngôn ngữ của stream (`Vietnamese`, `English`) hoặc `auto`. Model chỉ bị ép theo ngôn ngữ này khi `asr.force_language: true`. |
+| `asr.force_language on: ...` | INFO | Lúc khởi động, khi bật ép ngôn ngữ. |
+| `model prompt language=... ends with '...'` | INFO | Chỉ khi `asr.force_language: true`, mỗi ngôn ngữ một lần: phần cuối prompt vLLM đã dựng. Ép đúng thì dòng `Vietnamese` kết thúc bằng `<\|im_start\|>assistant\nlanguage Vietnamese<asr_text>`, và phần trước đó giống dòng `auto` (nếu có). |
 | `commit call=... utterance=... reason=... words=... skipped_partials=N` | INFO | Đã phát một FINAL. `N` khác 0 nghĩa là utterance này đã bị bỏ N lần nhận dạng PARTIAL vì model chậm hơn audio. |
 | `asr backlog call=...: ... ms of audio waiting; PARTIAL inference is skipped ...` | WARNING | Model không theo kịp stream này; PARTIAL thưa đi. Ghi một lần cho mỗi stream. |
 | `asr error call=... consecutive=N: ...` | ERROR | Model lỗi; mất utterance đó, stream vẫn mở. |
@@ -428,7 +440,7 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 | `protocol error: ...` | WARNING | Client vi phạm hợp đồng; stream bị đóng. |
 | `chunk_seq gap ...: expected ..., got ...` | WARNING | rtpgw đã bỏ chunk vì hàng đợi gửi của nó đầy; phần audio đó mất, stream vẫn xử lý tiếp. Ghi 3 lần đầu của mỗi stream, sau đó mỗi 500 lần. |
 | `rtp_timestamp jump ... chunk_seq=...: expected ..., got ...` | WARNING | `rtp_timestamp` của chunk không nối tiếp audio đã nhận; từ chunk đó `ts_start`/`ts_end` tính theo giá trị mới. Ghi 3 lần đầu của mỗi stream, sau đó mỗi 500 lần. |
-| `model reported language ...` | WARNING | Model báo ngôn ngữ ngoài `vi`/`en`; `language` để rỗng. |
+| `model reported language ...` | WARNING | Model báo ngôn ngữ ngoài `vi`/`en`; `language` để rỗng. Chỉ xảy ra khi model tự đoán: `asr.force_language: false`, hoặc stream `auto`. |
 | `punctuation not ready after ... ms; using raw text` | WARNING | Punctuation quá hạn; kết quả dùng text chưa có dấu câu. |
 | `asr_result call=... leg=... utterance=... revision=... event=... language=... han_chars=N model_output=... raw=... text=...` | INFO | Chỉ có khi `asr.log_results: true`. Mỗi PARTIAL và COMMIT server tạo ra một dòng, ghi trước bước hiện từng từ. Câu trả lời của model không đổi text thì không tạo kết quả nên không có dòng này. |
 

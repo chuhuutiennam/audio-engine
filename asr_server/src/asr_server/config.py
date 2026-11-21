@@ -36,6 +36,8 @@ class Settings:
     partial_max_backlog_ms: int = 500         # 0 = never skip a PARTIAL inference
     use_language_source: bool = False         # read AudioChunk.language_source
     asr_log_results: bool = False             # log language and text of every PARTIAL and COMMIT
+    default_language: str = 'vi'              # vi | en | auto: stream that names no language
+    force_language: bool = False              # native_vllm: transcribe the stream's language
     # vad
     vad_backend: str = 'silero'               # silero | webrtc
     silero_model: str = '/opt/models/silero_vad.jit'
@@ -91,6 +93,8 @@ _KEYS = {
     ('asr', 'partial_max_backlog_ms'): 'partial_max_backlog_ms',
     ('asr', 'use_language_source'): 'use_language_source',
     ('asr', 'log_results'): 'asr_log_results',
+    ('asr', 'default_language'): 'default_language',
+    ('asr', 'force_language'): 'force_language',
     ('vad', 'backend'): 'vad_backend',
     ('vad', 'silero_model'): 'silero_model',
     ('vad', 'threshold'): 'vad_threshold',
@@ -123,7 +127,8 @@ class ConfigError(ValueError):
 
 def _coerce(name, value):
     kind = _TYPES[name]
-    if kind is Optional[float]:
+    # ==, not `is`: Optional[float] is a new object once typing's cache has dropped it.
+    if kind == Optional[float]:
         if value is None:
             return None
         kind = float
@@ -157,6 +162,9 @@ def _validate(s: Settings):
         raise ConfigError("vad.backend must be 'silero' or 'webrtc'")
     if s.dtype not in ('auto', 'float16', 'bfloat16'):
         raise ConfigError("asr.dtype must be 'auto', 'float16' or 'bfloat16'")
+    # speech_service.LANGUAGE_NAMES and AUTO_CODE; not imported, so that config needs no gRPC
+    if s.default_language not in ('vi', 'en', 'auto'):
+        raise ConfigError("asr.default_language must be 'vi', 'en' or 'auto'")
     if s.max_model_len < 1 or s.max_num_seqs < 1 or s.vad_workers < 1:
         raise ConfigError('asr.max_model_len, asr.max_num_seqs and vad.workers must be >= 1')
     if not 0.0 < s.vad_threshold < 1.0:

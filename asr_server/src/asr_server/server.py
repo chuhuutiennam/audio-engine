@@ -95,9 +95,13 @@ class ASRService:
                  partial_max_backlog_ms=500,
                  max_consecutive_errors=3, punct_workers=1,
                  punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000,
-                 log_results=False):
+                 log_results=False, default_language='Vietnamese'):
+        """`default_language`: model language name or pb.AUTO_LANGUAGE, for a stream that names none."""
         if not 0.2 <= chunk_sec < max_utterance_sec:
             raise ValueError('require 0.2 <= chunk_sec < max_utterance_sec')
+        if not default_language:
+            raise ValueError('default_language must be a language name or auto')
+        self.default_language = default_language
         self.asr = model
         self.punctuator = punctuator
         # Punctuators written before the language argument existed keep working.
@@ -220,7 +224,7 @@ class ASRService:
             skipped_partials = 0
             deferred_chunks = 0
             asr_state = self.asr.init_streaming_state(
-                language=cfg.language or 'Vietnamese',
+                language=stream_language(),
                 unfixed_chunk_num=2, unfixed_token_num=5,
                 chunk_size_sec=self.chunk_sec)
             converter = PCM16kConverter(cfg.sample_rate)
@@ -235,9 +239,14 @@ class ASRService:
             stable_count = 0
             partial_sent = False
 
+        def stream_language():
+            """Language name the client asked for, else the server default; None = the model detects it."""
+            language = cfg.language or self.default_language
+            return None if language == pb.AUTO_LANGUAGE else language
+
         def utterance_language():
-            """Language of the open utterance: what the model reports, else what the client asked for."""
-            return (asr_state.language if asr_state is not None else '') or cfg.language or ''
+            """Language of the open utterance: what the model reports, else what the stream asked for."""
+            return (asr_state.language if asr_state is not None else '') or stream_language() or ''
 
         def make_event(kind, text, raw_text, reason, end_ms, answered=True):
             """`answered` is False when the model failed: its last answer says nothing about this event."""
@@ -533,8 +542,9 @@ class ASRService:
                         vad = await loop.run_in_executor(self.vad_pool, self.build_vad,
                                                          cfg.sample_rate)
                     vad_offload = bool(getattr(vad, 'offload', False))
-                    LOG.info('start call=%s leg=%s rate=%d codec=%d',
-                             cfg.call_id, cfg.leg_id, cfg.sample_rate, cfg.encoding)
+                    LOG.info('start call=%s leg=%s rate=%d codec=%d language=%s',
+                             cfg.call_id, cfg.leg_id, cfg.sample_rate, cfg.encoding,
+                             stream_language() or pb.AUTO_LANGUAGE)
                     continue
 
                 if what == 'audio':
@@ -619,7 +629,11 @@ async def serve(args):
             max_model_len=args.max_model_len,
             max_num_seqs=args.max_num_seqs,
             dtype=args.dtype,
-            enforce_eager=args.enforce_eager)
+            enforce_eager=args.enforce_eager,
+            force_language=args.force_language)
+        if args.force_language:
+            LOG.info('asr.force_language on: the model transcribes the language of the stream; '
+                     'default %s', args.default_language)
     else:
         from qwen_asr import Qwen3ASRModel
         LOG.info('loading Qwen3-ASR via qwen_asr streaming: %s', args.model)
@@ -632,6 +646,9 @@ async def serve(args):
                               threshold=args.punct_threshold)
     if args.asr_log_results:
         LOG.warning('asr.log_results is on: the text of every call is written to the log')
+    from .speech_service import AUTO_CODE, LANGUAGE_NAMES, SpeechStreamService
+    default_language = (pb.AUTO_LANGUAGE if args.default_language == AUTO_CODE
+                        else LANGUAGE_NAMES[args.default_language])
     service = ASRService(
         asr, punctuator, chunk_sec=args.chunk_sec,
         max_utterance_sec=args.max_utterance_sec,
@@ -650,14 +667,14 @@ async def serve(args):
         punct_workers=args.punct_workers,
         punct_partial_timeout_ms=args.punct_partial_timeout_ms,
         punct_commit_timeout_ms=args.punct_commit_timeout_ms,
-        log_results=args.asr_log_results)
+        log_results=args.asr_log_results,
+        default_language=default_language)
     server = grpc.aio.server(
         maximum_concurrent_rpcs=args.max_streams,
         options=[('grpc.max_receive_message_length', 2 * 1024 * 1024),
                  ('grpc.keepalive_time_ms', 30000),
                  ('grpc.keepalive_timeout_ms', 10000)])
     from .proto import speech_pb2_grpc
-    from .speech_service import SpeechStreamService
     speech_pb2_grpc.add_SpeechStreamServicer_to_server(
         SpeechStreamService(service, use_language_source=args.use_language_source,
                             word_reveal=args.word_reveal), server)

@@ -34,7 +34,7 @@ Backends are chosen in `config/server.yaml`:
 
 | Key | Default | Alternative |
 |---|---|---|
-| `asr.backend` | `native_vllm`: `vllm.LLM.chat()` on the audio accumulated for the utterance; language auto-detected | `qwen_asr`: streaming state of the `qwen_asr` package (needs `qwen-asr[vllm]`) |
+| `asr.backend` | `native_vllm`: `vllm.LLM.chat()` on the audio accumulated for the utterance; language auto-detected unless `asr.force_language` | `qwen_asr`: streaming state of the `qwen_asr` package (needs `qwen-asr[vllm]`) |
 | `vad.backend` | `silero`: Silero TorchScript on CPU, 32 ms frames | `webrtc`: WebRTC VAD, 20 ms frames (needs `webrtcvad-wheels`) |
 
 The rest of this document describes the defaults.
@@ -57,11 +57,27 @@ more GPU work as utterances get longer. Max utterance is bounded to 15s by
 default. Audio data URIs require no
 network and are created in RAM, not on disk.
 
-Language: native vLLM chat auto-detects the spoken language. The model answers
-`language Vietnamese<asr_text>...`; the server removes the marker and uses the
-language it names as `Transcript.language` and as the language given to
-punctuation. The language sent by the client is only the value reported until
-the model has named one. It is not forced on the model.
+Language: by default native vLLM chat auto-detects the spoken language. The model
+answers `language Vietnamese<asr_text>...`; the server removes the marker and uses
+the language it names as `Transcript.language` and as the language given to
+punctuation. The language of the stream (`AudioChunk.language`, else
+`asr.default_language`) is then only the value reported until the model has named one.
+
+With `asr.force_language: true`, the language of the stream is forced on the model
+instead: the server appends `language Vietnamese<asr_text>` (or `English`) to the
+generation prompt of the model's chat template, as the `qwen_asr` package does for a
+forced language, and passes that template to `LLM.chat(chat_template=...)`. The model
+then writes the text only and the result keeps the forced language. A stream whose
+language is `auto` is still detected. The template is read from the model directory
+(`chat_template.jinja`, `chat_template.json` or `tokenizer_config.json`); without one
+the server does not start. Once per language, `model prompt language=... ends with
+'...'` logs the end of the prompt vLLM built. The `qwen_asr` backend always forces
+the language of the stream (except `auto`), whatever `asr.force_language` says.
+
+| Key | Default | Values |
+|---|---|---|
+| `asr.default_language` | `vi` | `vi`, `en` or `auto`: language of a stream whose `language` is empty or unknown. Replaces the former fixed `Vietnamese`. |
+| `asr.force_language` | `false` | `true`: force the language of the stream (native_vllm). |
 
 ## gRPC contract (`speech.proto`)
 
@@ -88,7 +104,7 @@ message: the first chunk fixes the stream.
 | `chunk_seq` | Normally increases by 1 from its first value. A gap means the gateway dropped chunks from its send queue: it is logged at WARNING (the first 3 gaps of a stream, then every 500th) and processing goes on with the audio that arrived. `-1` on the first chunk turns the check off. |
 | `duration_ms` | Informational; the duration is computed from `pcm`. |
 | `end_of_stream` | `true`: the audio in this chunk is processed, the open utterance is committed, the stream is closed. Nothing after it is read. Closing the request stream without it has the same effect. |
-| `language` | `vi`, `en` or empty. With the default backend the model auto-detects the language, so this is only the value reported until the model names one. Unknown codes are logged and treated as empty. Read from the first chunk only. |
+| `language` | `vi`, `en`, `auto` or empty. Empty and unknown codes (logged) take `asr.default_language`; `auto` lets the model detect the language. With `asr.force_language: false` (default) the model detects the language anyway, so this is only the value reported until the model names one. Read from the first chunk only. |
 | `language_source` | Used instead of `language` only when `asr.use_language_source: true`. |
 | `task` | `speech_to_text` or empty. The gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. Must not change. |
 
@@ -108,7 +124,7 @@ chunks: resampling each 80 ms chunk on its own creates discontinuities.
 | `revision` (21) | Increases with every result of the utterance | Last revision + 1; restarts at 1 for the next utterance |
 | `seq` | Starts at 1, +1 for every result of the stream, no gaps | same |
 | `ts_start`, `ts_end` | RTP timestamps on the source clock, **modulo 2^32**, half-open `[ts_start, ts_end)`. Derived from the `rtp_timestamp` of the chunk that carried the audio (the latest anchor at or before that position) and the audio position; when `rtp_timestamp` jumped inside an utterance, `ts_start` is on the old timeline and `ts_end` on the new one. From VAD, **not** word timestamps; pre-roll and hangover are included. After a wrap `ts_end` is numerically smaller than `ts_start`. | same; `ts_end` is the end of the utterance |
-| `language` | `vi` or `en`: the language the model reports, else the one configured. Empty when the model reports any other language (logged at WARNING, the utterance is processed normally). | same |
+| `language` | `vi` or `en`: the forced language, else the language the model reports, else the one of the stream. Empty when the model reports any other language (logged at WARNING, the utterance is processed normally), or names none on an `auto` stream. | same |
 | `reason` (23) | `COMMIT_REASON_UNSPECIFIED` | See below |
 | `status` (24) | `RESULT_STATUS_OK` | `RESULT_STATUS_OK` (other values are reserved) |
 | `confidence` | `0.0`: no confidence is available, not "0 %" | same |

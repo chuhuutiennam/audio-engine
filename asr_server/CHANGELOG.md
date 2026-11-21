@@ -18,6 +18,12 @@
   version it replaces is kept in `backup/rolled-back/`.
 - `bin/wait_ready.sh` waits until the started process listens on its port and records
   `health=ok|failed` in `VERSION`.
+- `asr.force_language` in `config/server.yaml`, off by default: the native vLLM backend transcribes
+  the language of the stream (`vi`, `en`) instead of letting the model detect it, by appending
+  `language <name><asr_text>` to the model's chat template. Needs the chat template in the model
+  directory. Logs `model prompt language=... ends with ...` once per language.
+- `asr.default_language` (`vi`, `en` or `auto`, default `vi`): language of a stream whose
+  `AudioChunk.language` is empty or unknown. `AudioChunk.language` also accepts `auto`.
 
 ### Changed
 
@@ -26,17 +32,23 @@
   `--ignore-old-config`.
 - `scripts/update.sh --restart` also starts a server that was stopped, unless models are missing.
 - A refused update writes the new defaults to `config/*.dist.new` and leaves `config/*.dist` alone.
+- A stream without a language took the fixed `Vietnamese`; it now takes `asr.default_language`
+  (same result with the default `vi`). The `start` log line shows the language of the stream.
 
 ### Fixed
 
 - `bin/status.sh` reported a running server as failed when the configuration had become invalid, so
   `scripts/update.sh` replaced the code without stopping that server. `scripts/update.sh` now reads
   the pid file itself.
+- `vad.neg_threshold` could be refused with "expected a non-empty string" once typing's cache had
+  dropped `Optional[float]` (it depended on the modules imported before the configuration was read).
 
 ### Files changed
 
 - New: `src/asr_server/word_pacer.py`, `bin/_upgrade.sh`, `bin/rollback.sh`, `bin/wait_ready.sh`,
-  `tests/test_word_pacer.py`, `tests/test_result_log.py`, `tests/test_upgrade_rollback.py`.
+  `tests/test_word_pacer.py`, `tests/test_result_log.py`, `tests/test_upgrade_rollback.py`,
+  `tests/test_force_language.py`.
 - Changed: `src/asr_server/speech_service.py`, `src/asr_server/server.py`, `src/asr_server/config.py`,
-  `src/asr_server/text_clean.py`, `config/server.yaml`, `bin/env.sh.example`, `bin/status.sh`,
-  `scripts/build.sh`, `scripts/update.sh`, `tests/test_config.py`, `README.md`, `HUONG_DAN_CAI_DAT.md`.
+  `src/asr_server/text_clean.py`, `src/asr_server/asr_backend.py`, `src/asr_server/messages.py`,
+  `config/server.yaml`, `bin/env.sh.example`, `bin/status.sh`, `scripts/build.sh`, `scripts/update.sh`,
+  `tests/test_config.py`, `README.md`, `HUONG_DAN_CAI_DAT.md`, `docs/Thiet_ke_Speech_Engine_v1.1.md`.
