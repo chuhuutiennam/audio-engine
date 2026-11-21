@@ -218,7 +218,7 @@ Các khóa còn lại (VAD, punctuation, semantic) có chú thích ngay trong fi
 
 Bật hiện từng từ: sửa `asr.chunk_sec: 0.5` và `word_reveal.enabled: true` trong `config/server.yaml` của thư mục chạy, rồi chạy `bin/stop.sh` và `bin/start.sh`. `scripts/update.sh` không ghi đè file này. Muốn tắt, đặt lại hai giá trị cũ và khởi động lại.
 
-Bật ép ngôn ngữ: **sau khi** nâng cấp xong (code cũ từ chối khóa lạ), thêm `force_language: true` vào mục `asr` của `config/server.yaml` ở thư mục chạy, đổi `default_language` nếu cần, rồi chạy `bin/stop.sh` và `bin/start.sh`. Kiểm tra trong `logs/asr-server.log`:
+Bật ép ngôn ngữ: **sau khi** nâng cấp xong (code cũ từ chối khóa lạ), thêm `force_language: true` vào mục `asr` của `config/server.yaml` ở thư mục chạy, đổi `default_language` nếu cần, rồi chạy `bin/stop.sh` và `bin/start.sh`. Kiểm tra trong `logs/asr-server.log` (lệnh ở cuối mục 12.1):
 
 1. Có dòng `asr.force_language on`.
 2. Sau cuộc gọi đầu tiên có dòng `model prompt language=Vietnamese ends with '...<|im_start|>assistant\nlanguage Vietnamese<asr_text>'`.
@@ -457,6 +457,44 @@ Tìm các kết quả có chữ Hán, gồm cả các file log đã xoay vòng:
 ```bash
 grep -h 'asr_result' logs/asr-server.log* | grep -v 'han_chars=0 '
 ```
+
+**Kiểm tra ép ngôn ngữ** sau khi bật `asr.force_language: true` và khởi động lại (mục 7). `L` in log từ lần khởi động gần nhất. Nếu server khởi động từ trước nửa đêm, dòng `loading` đã sang file `logs/asr-server.log.<ngày>` nên `L` in cả file hôm nay.
+
+```bash
+cd /u01/ims/audio-engine
+grep -nE 'force_language|default_language|log_results' config/server.yaml
+N=$(grep -n 'loading Qwen3-ASR' logs/asr-server.log | tail -1 | cut -d: -f1)
+L() { tail -n +"${N:-1}" logs/asr-server.log; }
+
+# 1. Khởi động
+L | grep -E 'loading Qwen3-ASR|asr.force_language on|listening on'
+L | grep -E 'ERROR|Traceback' | head -20
+
+# 2. Prompt vLLM đã dựng (có sau cuộc gọi đầu tiên)
+L | grep 'model prompt language='
+
+# 3. Ngôn ngữ của các stream, và các lần model tự đoán
+L | grep 'start call=' | grep -o 'language=[A-Za-z]*' | sort | uniq -c
+L | grep -o "model reported language '[^']*'" | sort | uniq -c
+
+# 4. Kết quả nhận dạng (cần asr.log_results: true)
+L | grep 'asr_result' | grep -c "model_output='language "
+L | grep 'asr_result' | grep -o ' language=[^ ]*' | sort | uniq -c
+L | grep 'asr_result' | grep -v 'han_chars=0 ' | tail -20
+L | grep 'asr_result' | grep 'event=COMMIT' | tail -30
+
+# Theo dõi trực tiếp khi gọi thử (Ctrl+C để dừng)
+tail -f logs/asr-server.log | grep --line-buffered -E 'start call=|model prompt|model reported language|asr_result|ERROR'
+```
+
+| Bước | Kết quả đúng | Nếu khác |
+|---|---|---|
+| 1 | Có `asr.force_language on: ... default vi` (giá trị của `asr.default_language`), rồi `listening on ...`. Không có `ERROR`, `Traceback`. | Server không khởi động: đọc `logs/asr-server.out`. Thiếu chat template thì có `no chat template in ...`. |
+| 2 | Dòng `Vietnamese` kết thúc bằng `<\|im_start\|>assistant\nlanguage Vietnamese<asr_text>'`. | Đã có cuộc gọi mà không có dòng nào: vLLM không trả về prompt. Dùng bước 4 để kiểm tra. |
+| 3 | Các stream có `language=Vietnamese`. Lệnh thứ hai không in gì. | Còn `model reported language`: xem stream đó có phải `auto` không (dòng `start` ghi `language=auto`). |
+| 4 | Lệnh đầu in `0`. Chỉ có `language=Vietnamese`. Lệnh `han_chars` không in gì. | `model_output` còn bắt đầu bằng `language `: model vẫn tự chọn ngôn ngữ, ép không có tác dụng. Đặt lại `force_language: false`, khởi động lại, giữ log bước 2 và 4. |
+
+Dòng `asr_result` chứa nội dung cuộc gọi: che bớt trước khi gửi ra ngoài.
 
 ### 12.2. Sự cố
 
