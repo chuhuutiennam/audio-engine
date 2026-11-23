@@ -3,6 +3,9 @@
 AudioChunk  -> messages.StreamRequest   (config taken from the first chunk)
 Transcript  -> RecognitionResult        (RTP ticks, language codes, seq, reason enum)
 
+The task of the first chunk picks the pipeline: noise_reduction goes to
+noise_service.NoiseReductionService when it is on; everything below is speech_to_text.
+
 Contract enforced here (see README, "gRPC contract"):
 - one RPC carries one (session_id, stream_id); the session fields of the first
   chunk must not change;
@@ -38,8 +41,10 @@ LANGUAGE_CODES = {name.lower(): code for code, name in LANGUAGE_NAMES.items()}
 AUTO_CODE = 'auto'      # the model detects the language; never sent back to the client
 
 SUPPORTED_TASKS = ('', 'speech_to_text')
-# Tasks the gateway may route here that this engine does not implement.
-OTHER_GATEWAY_TASKS = ('realtime_translation', 'keyword', 'voice_controller_emoji', 'noise_reduction')
+# Served by noise_service.NoiseReductionService when noise_reduction.enabled is true.
+NOISE_TASK = 'noise_reduction'
+# Tasks the gateway may route here that this engine does not implement (or has off).
+OTHER_GATEWAY_TASKS = ('realtime_translation', 'keyword', 'voice_controller_emoji', NOISE_TASK)
 
 REASONS = {
     'vad_endpoint': pb.COMMIT_REASON_SILENCE,
@@ -115,11 +120,14 @@ class _Stream:
 
 
 class SpeechStreamService(pb_grpc.SpeechStreamServicer):
-    def __init__(self, core, *, use_language_source=False, word_reveal=None):
-        """`word_reveal`: (window_ms, min_interval_ms) to reveal PARTIALs word by word; None = off."""
+    def __init__(self, core, *, use_language_source=False, word_reveal=None, noise=None):
+        """`core`: the speech_to_text core (server.ASRService); None = asr.enabled is false.
+        `word_reveal`: (window_ms, min_interval_ms) to reveal PARTIALs word by word; None = off.
+        `noise`: noise_service.NoiseReductionService; None = noise_reduction is off."""
         self.core = core
         self.use_language_source = bool(use_language_source)
         self.word_reveal = word_reveal
+        self.noise = noise
 
     # ------------------------------------------------------------------ input
     def _language_code(self, chunk):
@@ -236,12 +244,27 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
 
     # -------------------------------------------------------------------- rpc
     async def Recognize(self, request_iterator, context):
+        # The task of the first chunk picks the pipeline.
+        first = await anext(request_iterator, None)
+        if first is not None and first.task == NOISE_TASK and self.noise is not None:
+            async for result in self.noise.Recognize(first, request_iterator, context):
+                yield result
+            return
+        if self.core is None:
+            await self._refuse_without_asr(first, context)
+            return
         holder = {}
+
+        async def chunks():
+            if first is not None:
+                yield first
+                async for chunk in request_iterator:
+                    yield chunk
 
         async def requests():
             stream = None
             sequence = 0
-            async for chunk in request_iterator:
+            async for chunk in chunks():
                 if stream is None:
                     stream = holder['stream'] = self._open(chunk)
                     yield m.StreamRequest(config=m.StreamConfig(
@@ -268,3 +291,16 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
         except ProtocolError as exc:
             LOG.warning('protocol error: %s', exc.details)
             await context.abort(exc.code, exc.details)
+
+    async def _refuse_without_asr(self, first, context):
+        """asr.enabled is false: the same checks as speech_to_text, then UNIMPLEMENTED."""
+        if first is None:
+            return
+        try:
+            self._open(first)
+        except ProtocolError as exc:
+            LOG.warning('protocol error: %s', exc.details)
+            await context.abort(exc.code, exc.details)
+            return
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED,
+                            'task speech_to_text is off on this engine (asr.enabled: false)')
