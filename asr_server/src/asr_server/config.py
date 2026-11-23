@@ -15,6 +15,9 @@ import yaml
 
 @dataclass(frozen=True)
 class Settings:
+    # tasks served (AudioChunk.task); a task that is off ends with UNIMPLEMENTED
+    asr_enabled: bool = True                  # speech_to_text: loads Qwen3-ASR, VAD and punctuation
+    noise_enabled: bool = False               # noise_reduction: DPDFNet-2 (sherpa-onnx, CPU)
     # server
     host: str = '0.0.0.0'
     port: int = 50051
@@ -63,6 +66,12 @@ class Settings:
     word_reveal_enabled: bool = False
     word_reveal_window_ms: int = 400
     word_reveal_min_interval_ms: int = 120
+    # noise_reduction (docs/DPDFNet2_Task_Routing_Design_VI.md, section 7.2)
+    noise_model: str = '/opt/models/dpdfnet2.onnx'
+    noise_frame_ms: int = 20                  # audio per result: 20 | 40 | 80
+    noise_num_threads: int = 1                # ONNX threads of each denoiser
+    noise_workers: int = 2                    # threads that run the denoisers of all streams
+    noise_max_streams: int = 16               # denoisers loaded at start; one per stream
 
     @property
     def word_reveal(self):
@@ -79,6 +88,7 @@ _KEYS = {
     ('server', 'max_streams'): 'max_streams',
     ('server', 'ingress_max_ms'): 'ingress_max_ms',
     ('server', 'audio_timeout_ms'): 'audio_timeout_ms',
+    ('asr', 'enabled'): 'asr_enabled',
     ('asr', 'backend'): 'asr_backend',
     ('asr', 'model'): 'model',
     ('asr', 'chunk_sec'): 'chunk_sec',
@@ -116,6 +126,12 @@ _KEYS = {
     ('word_reveal', 'enabled'): 'word_reveal_enabled',
     ('word_reveal', 'window_ms'): 'word_reveal_window_ms',
     ('word_reveal', 'min_interval_ms'): 'word_reveal_min_interval_ms',
+    ('noise_reduction', 'enabled'): 'noise_enabled',
+    ('noise_reduction', 'model'): 'noise_model',
+    ('noise_reduction', 'frame_ms'): 'noise_frame_ms',
+    ('noise_reduction', 'num_threads'): 'noise_num_threads',
+    ('noise_reduction', 'workers'): 'noise_workers',
+    ('noise_reduction', 'max_streams'): 'noise_max_streams',
 }
 _SECTIONS = sorted({section for section, _ in _KEYS})
 _TYPES = {f.name: f.type for f in fields(Settings)}
@@ -188,6 +204,15 @@ def _validate(s: Settings):
         raise ConfigError('require 1 <= word_reveal.min_interval_ms <= word_reveal.window_ms')
     if s.word_reveal_enabled and s.word_reveal_window_ms > s.chunk_sec * 1000:
         raise ConfigError('word_reveal.window_ms must not be longer than asr.chunk_sec')
+    if not (s.asr_enabled or s.noise_enabled):
+        raise ConfigError('asr.enabled and noise_reduction.enabled are both false: no task to serve')
+    # The gateway packetizes multiples of 640 bytes (20 ms of PCM16 at 16 kHz).
+    if s.noise_frame_ms not in (20, 40, 80):
+        raise ConfigError('noise_reduction.frame_ms must be 20, 40 or 80')
+    if s.noise_num_threads < 1 or s.noise_workers < 1 or s.noise_max_streams < 1:
+        raise ConfigError('noise_reduction.num_threads, workers and max_streams must be >= 1')
+    if s.noise_enabled and s.noise_max_streams > s.max_streams:
+        raise ConfigError('noise_reduction.max_streams must not be above server.max_streams')
 
 
 def load_settings(path, overrides=None) -> Settings:

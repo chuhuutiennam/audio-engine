@@ -36,7 +36,10 @@ NEW_DEFAULTS = dict(ingress_max_ms=3000, audio_timeout_ms=2000, asr_max_consecut
                     # the text of the calls stays out of the log unless asked for
                     asr_log_results=False,
                     # word-by-word reveal of PARTIAL results, off by default
-                    word_reveal_enabled=False, word_reveal_window_ms=400, word_reveal_min_interval_ms=120)
+                    word_reveal_enabled=False, word_reveal_window_ms=400, word_reveal_min_interval_ms=120,
+                    # task noise_reduction (DPDFNet-2), off by default; speech_to_text stays on
+                    asr_enabled=True, noise_enabled=False, noise_model='/opt/models/dpdfnet2.onnx',
+                    noise_frame_ms=20, noise_num_threads=1, noise_workers=2, noise_max_streams=16)
 ALL_DEFAULTS = {**FORMER_CLI_DEFAULTS, **NEW_DEFAULTS}
 
 
@@ -80,6 +83,23 @@ def test_language_settings_are_read_from_the_asr_section(tmp_path, code):
     assert (s.default_language, s.force_language) == (code, True)
 
 
+def test_noise_reduction_is_read_from_its_section(tmp_path):
+    s = load_settings(write(tmp_path, (
+        'asr:\n  enabled: false\n'
+        'noise_reduction:\n  enabled: true\n  model: /m/dpdfnet2.onnx\n  frame_ms: 40\n'
+        '  num_threads: 2\n  workers: 4\n  max_streams: 8\n')))
+    assert (s.asr_enabled, s.noise_enabled, s.noise_model, s.noise_frame_ms, s.noise_num_threads,
+            s.noise_workers, s.noise_max_streams) == (False, True, '/m/dpdfnet2.onnx', 40, 2, 4, 8)
+
+
+def test_noise_reduction_limits_apply_only_when_enabled(tmp_path):
+    # default noise_reduction.max_streams (16) above server.max_streams is fine while it is off
+    assert load_settings(write(tmp_path, 'server:\n  max_streams: 8\n')).max_streams == 8
+    s = load_settings(write(tmp_path, 'server:\n  max_streams: 8\nnoise_reduction:\n  enabled: true\n'
+                                      '  max_streams: 8\n'))
+    assert (s.noise_enabled, s.noise_max_streams) == (True, 8)
+
+
 def test_values_and_overrides(tmp_path):
     path = write(tmp_path, 'server:\n  port: 6000\nasr:\n  chunk_sec: 2\nsemantic:\n  early_commit: true\n')
     s = load_settings(path)
@@ -120,6 +140,18 @@ def test_values_and_overrides(tmp_path):
     'word_reveal:\n  windows_ms: 400\n',
     # the words of one PARTIAL must be out before the next PARTIAL arrives
     'asr:\n  chunk_sec: 0.5\nword_reveal:\n  enabled: true\n  window_ms: 600\n',
+    'asr:\n  enabled: 1\n',
+    'asr:\n  enabled: false\n',                # no task left to serve
+    'noise_reduction:\n  enabled: 1\n',
+    'noise_reduction:\n  model: ""\n',
+    'noise_reduction:\n  frame_ms: 10\n',      # the gateway wants multiples of 640 bytes (20 ms)
+    'noise_reduction:\n  frame_ms: 30\n',
+    'noise_reduction:\n  num_threads: 0\n',
+    'noise_reduction:\n  workers: 0\n',
+    'noise_reduction:\n  max_streams: 0\n',
+    'noise_reduction:\n  max_stream: 4\n',
+    # gRPC would refuse the extra RPCs before the denoiser pool does
+    'server:\n  max_streams: 8\nnoise_reduction:\n  enabled: true\n',
     '- not\n- a mapping\n',
 ])
 def test_invalid_config_is_rejected(tmp_path, text):
