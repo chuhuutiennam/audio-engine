@@ -72,6 +72,7 @@ def test_first_install(source, tmp_path):
     assert f'model: {home}/model/Qwen3-ASR-1.7B' in config
     assert f'silero_model: {home}/model/silero_vad.jit' in config
     assert f'model: {home}/model/punctuation-restoration-small' in config
+    assert f'model: {home}/model/dpdfnet2.onnx' in config
     assert '/opt/models' not in config
     assert (home / 'config' / 'logging.yaml').is_file()
 
@@ -79,6 +80,51 @@ def test_first_install(source, tmp_path):
     assert f'MISSING  ASR model directory: {home}/model/Qwen3-ASR-1.7B' in result.stdout
     assert f'MISSING  punctuation model directory: {home}/model/punctuation-restoration-small' in result.stdout
     assert f'MISSING  Silero VAD file: {home}/model/silero_vad.jit' in result.stdout
+    # noise_reduction is off by default: its model is not asked for
+    assert 'DPDFNet-2' not in result.stdout and 'sherpa-onnx' not in result.stdout
+
+
+def _set_tasks(home, asr, noise):
+    """Switch the tasks in the run directory's server.yaml (as shipped, after a first install)."""
+    config = home / 'config' / 'server.yaml'
+    text = config.read_text()
+    asr_line = '  enabled: true              # task speech_to_text'
+    noise_line = '  enabled: false             # false: noise_reduction ends with UNIMPLEMENTED'
+    assert asr_line in text and noise_line in text
+    text = text.replace(asr_line, asr_line.replace('true ', 'false', 1) if not asr else asr_line)
+    text = text.replace(noise_line, noise_line.replace('false', 'true ', 1) if noise else noise_line)
+    config.write_text(text)
+
+
+def _sherpa_installed():
+    return subprocess.run([sys.executable, '-c', 'import sherpa_onnx'], capture_output=True).returncode == 0
+
+
+def test_noise_only_install_asks_for_no_asr_model(source, tmp_path):
+    home = tmp_path / 'app'
+    assert update(source, home).returncode == 0
+    _set_tasks(home, asr=False, noise=True)
+    (home / 'model' / 'dpdfnet2.onnx').write_bytes(b'onnx')
+    result = update(source, home, '--no-build')
+    assert result.returncode == 0, result.stderr
+    assert 'ASR model' not in result.stdout and 'punctuation model' not in result.stdout
+    assert 'Silero' not in result.stdout and 'DPDFNet-2' not in result.stdout
+    if _sherpa_installed():
+        assert 'MISSING' not in result.stdout and 'copy the missing models' not in result.stdout
+        assert f'start with: {home}/bin/start.sh' in result.stdout
+    else:
+        assert 'MISSING  Python package sherpa-onnx' in result.stdout
+
+
+def test_missing_noise_model_is_reported(source, tmp_path):
+    home = tmp_path / 'app'
+    assert update(source, home).returncode == 0
+    _set_tasks(home, asr=True, noise=True)
+    result = update(source, home, '--no-build')
+    assert result.returncode == 0, result.stderr
+    assert f'MISSING  DPDFNet-2 model file: {home}/model/dpdfnet2.onnx' in result.stdout
+    assert f'MISSING  ASR model directory: {home}/model/Qwen3-ASR-1.7B' in result.stdout
+    assert 'copy the missing models' in result.stdout
 
 
 def test_no_missing_report_when_the_models_are_present(source, tmp_path):

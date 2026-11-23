@@ -336,7 +336,11 @@ bash scripts/build.sh --test        # run the tests, then build into build/app
 ```
 
 - On the first install the model paths of `config/server.yaml` are set to
-  `<app home>/model/...`; missing model files are reported.
+  `<app home>/model/...`. Missing model files of the tasks that are on are
+  reported (`asr.enabled`: ASR, punctuation, Silero; `noise_reduction.enabled`:
+  `dpdfnet2.onnx` and the `sherpa-onnx` package). `--restart` then does not start
+  a server that was stopped, but a server that was running is started again
+  (and fails to start without its models).
 - An update validates the configuration found in the run directory against the
   new code and the installed code first. If it is not valid, or the server is
   running and `--restart` was not given, nothing is changed. Add the keys of a
@@ -521,8 +525,18 @@ speakers before ASR.
 ```bash
 python -m pip install -r requirements-dev.txt torch
 scripts/run_tests.sh            # server tests, then tools/eval tests
-python -m pytest tests -q       # server tests only
+python -m pytest tests -q       # server tests only, in one process (see below)
 ```
+
+`scripts/run_tests.sh` runs each file of `tests/` that starts a real gRPC server (or
+calls `serve()`) in its own interpreter (`GRPC_SERVER_TESTS`, kept complete by
+`tests/test_run_tests_script.py`). In one process, a full run on Windows sometimes hung
+in `tests/test_serve_noise.py` after `test_regression.py` (reproduced with those two
+files): the gRPC aio poller thread, shared by the process, was gone after an earlier
+test's event loop closed. The split makes that far less likely; it was never seen within
+one file. The `tools/eval` tests still run in one process (no hang seen there). The
+server itself runs one event loop. Extra arguments of the script are pytest options;
+every run gets them and the script goes on after a failure.
 
 Unit/integration tests use a deterministic fake ASR and local fake punctuation
 model; this tests streaming, VAD transitions, event semantics and word

@@ -259,7 +259,7 @@ Các bước:
 1. Cài gói trên server: `python3 -m pip install --no-index --find-links=/duong/dan/wheelhouse sherpa-onnx==2.0.2`, rồi kiểm tra `python3 -c "import sherpa_onnx; print(sherpa_onnx.__version__, hasattr(sherpa_onnx, 'OnlineSpeechDenoiser'))"` in `2.0.2 True`.
 2. Chép `dpdfnet2.onnx` vào `/u01/ims/audio-engine/model/` và kiểm tra SHA-256 như ở mục 3.
 3. **Sau khi** nâng cấp lên bản có khử nhiễu (code cũ từ chối khóa lạ): máy cài mới đã có sẵn mục `noise_reduction` trong `config/server.yaml`; máy đã cài từ trước thì chép nguyên mục `noise_reduction` từ `config/server.yaml.dist` (đường dẫn model ở đó đã trỏ vào `APP/model`). Đặt `enabled: true`.
-4. Chạy `--check-config`, rồi `bin/stop.sh` và `bin/start.sh`.
+4. Chạy `--check-config`, rồi `bin/stop.sh` và `bin/start.sh`. `scripts/update.sh` chỉ kiểm tra model của các task đang bật: thiếu thì báo `MISSING  DPDFNet-2 model file: ...` hoặc `MISSING  Python package sherpa-onnx==2.0.2 ...: <lý do>` (chưa cài, bản cũ không có `OnlineSpeechDenoiser`, hoặc thư viện native không nạp được); với `asr.enabled: false` không còn đòi model ASR, punctuation, Silero.
 5. Kiểm tra trong `logs/asr-server.log`: lúc khởi động có dòng `noise_reduction on: 16 denoisers loaded in ... s`; sau mỗi cuộc gọi có dòng `noise_reduction stream ended ... outcome=final` (mục 12.1).
 
 Muốn tắt, đặt lại `enabled: false` và khởi động lại: Gateway nhận `UNIMPLEMENTED` và phát audio gốc.

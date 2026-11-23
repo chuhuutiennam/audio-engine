@@ -42,6 +42,13 @@
 
 ### Changed
 
+- `scripts/update.sh` reports missing models only for the tasks that are on: with
+  `asr.enabled: false` it no longer asks for the ASR, punctuation and Silero models (a
+  noise-only server is started by `--restart`); with `noise_reduction.enabled: true` it reports
+  a missing `dpdfnet2.onnx` and a missing or too old `sherpa-onnx`, with the import error.
+- `scripts/run_tests.sh` runs each test file that starts a real gRPC server in its own
+  interpreter (a full run in one process sometimes hung on Windows), goes on after a failure
+  and accepts pytest options such as `-k`.
 - `scripts/update.sh` stops when the installed code cannot read the configuration, because that
   version could not be rolled back to. Add the keys of a new version after the update, or pass
   `--ignore-old-config`.
