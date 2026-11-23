@@ -39,7 +39,7 @@ AUTO_CODE = 'auto'      # the model detects the language; never sent back to the
 
 SUPPORTED_TASKS = ('', 'speech_to_text')
 # Tasks the gateway may route here that this engine does not implement.
-OTHER_GATEWAY_TASKS = ('realtime_translation', 'keyword', 'voice_controller_emoji')
+OTHER_GATEWAY_TASKS = ('realtime_translation', 'keyword', 'voice_controller_emoji', 'noise_reduction')
 
 REASONS = {
     'vad_endpoint': pb.COMMIT_REASON_SILENCE,

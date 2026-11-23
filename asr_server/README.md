@@ -106,7 +106,8 @@ message: the first chunk fixes the stream.
 | `end_of_stream` | `true`: the audio in this chunk is processed, the open utterance is committed, the stream is closed. Nothing after it is read. Closing the request stream without it has the same effect. |
 | `language` | `vi`, `en`, `auto` or empty. Empty and unknown codes (logged) take `asr.default_language`; `auto` lets the model detect the language. With `asr.force_language: false` (default) the model detects the language anyway, so this is only the value reported until the model names one. Read from the first chunk only. |
 | `language_source` | Used instead of `language` only when `asr.use_language_source: true`. |
-| `task` | `speech_to_text` or empty. The gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. Must not change. |
+| `task` | `speech_to_text` or empty. The gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`, `noise_reduction`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. Must not change. |
+| `output_audio_format` | Tag 14, ignored by `speech_to_text`. The format the gateway accepts for returned audio: absent/`LEGACY_ENCODED` = G.711 PCMU, `PCM_S16LE` = raw PCM 16 kHz (gateway `media.codec` g722 or l16). For tasks that return audio (`noise_reduction`, see `../docs/DPDFNet2_Task_Routing_Design_VI.md`). |
 
 Send audio at real-time pace. The engine never slows the sender down; if more
 than `server.ingress_max_ms` of audio is waiting for ASR the RPC ends with
@@ -183,7 +184,7 @@ default timing one PARTIAL of the model becomes at most 4 results, so at
 | Code | When |
 |---|---|
 | `INVALID_ARGUMENT` | Missing ids, bad `sample_rate`/`channels`, unknown `task`, odd `pcm` length, a session field changed |
-| `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword` or `voice_controller_emoji` |
+| `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword`, `voice_controller_emoji` or `noise_reduction` |
 | `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB |
 | `UNAVAILABLE` | `asr.max_consecutive_errors` model failures in a row |
 
@@ -191,7 +192,9 @@ What the gateway does with them: `INVALID_ARGUMENT` and `UNIMPLEMENTED` are
 permanent for it, it does not reconnect and closes the session. After
 `RESOURCE_EXHAUSTED` or `UNAVAILABLE` it reconnects up to `ai.max_retry` (3)
 times with a growing backoff, then closes the session; the new stream starts
-with a `chunk_seq` other than 0, which is accepted.
+with a `chunk_seq` other than 0, which is accepted. Exception: a `noise_reduction`
+session with `noise_reduction.on_ai_failure: passthrough` (gateway default) is not
+closed; the gateway plays the caller's original audio until the call ends.
 
 A client that is still writing when the engine ends the RPC may see `INTERNAL`
 instead of the code above; do not branch on the exact code.

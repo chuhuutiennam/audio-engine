@@ -364,6 +364,7 @@ def test_language_source_only_when_enabled():
     (dict(task='realtime_translation'), grpc.StatusCode.UNIMPLEMENTED),
     (dict(task='keyword'), grpc.StatusCode.UNIMPLEMENTED),
     (dict(task='voice_controller_emoji'), grpc.StatusCode.UNIMPLEMENTED),
+    (dict(task='noise_reduction'), grpc.StatusCode.UNIMPLEMENTED),   # gateway task, not served here yet
     (dict(task='something_else'), grpc.StatusCode.INVALID_ARGUMENT),
     (dict(task='summarise'), grpc.StatusCode.INVALID_ARGUMENT),
     (dict(session=''), grpc.StatusCode.INVALID_ARGUMENT),

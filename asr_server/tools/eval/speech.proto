@@ -1,10 +1,12 @@
 syntax = "proto3";
 
 // Gateway (rtpgw, media_ai/internal/ai/proto/speech.proto) <-> ASR engine contract.
-// Tags 1-14 of RecognitionResult are the gateway's. The engine adds tags 20-24; the
-// gateway decodes by tag and skips the ones it does not know. Do not reuse 12-14: the
-// gateway reads them as topic_label / topic_info / topic_score.
-// After editing run: python scripts/build_proto.py
+// Tags 1-14 of AudioChunk and 1-16 of RecognitionResult are the gateway's. The engine adds
+// RecognitionResult tags 20-24; the gateway decodes by tag and skips the ones it does not know.
+// Do not reuse RecognitionResult tags 12-16: the gateway reads them as topic_label / topic_info /
+// topic_score / audio_format / audio_sample_rate.
+// After editing run: python scripts/build_proto.py (it writes speech_pb2.py here and in tools/eval),
+// then copy this file to tools/eval/speech.proto (tests/test_proto_contract.py checks both copies).
 
 package speech;
 
@@ -22,12 +24,19 @@ message AudioChunk {
   int64  duration_ms    = 7;
   bool   end_of_stream  = 8;
   string language       = 9; // speech_to_text: source language (empty = auto). realtime_translation: TARGET language (vi|en); the source is detected
-  string task           = 10; // the gateway sends speech_to_text | realtime_translation | keyword | voice_controller_emoji;
+  string task           = 10; // the gateway sends speech_to_text | realtime_translation | keyword | voice_controller_emoji | noise_reduction;
                               // this engine serves speech_to_text only and ends the others with UNIMPLEMENTED
+                              // (noise_reduction design: audio-engine repo root, docs/DPDFNet2_Task_Routing_Design_VI.md)
   uint32 rtp_clock_rate = 11; // RTP clock Hz (e.g. 8000 for G.711, 0 = infer from sample_rate). int32 in the gateway's file: same wire format
   int64  chunk_seq      = 12; // monotonic per stream (0-based); a gap means the gateway dropped chunks: logged, processing goes on.
                               // -1 = not provided. uint64 in the gateway's file: same wire format
   string language_source = 13; // SOURCE language hint (vi|en); empty = not provided. Used only when asr.use_language_source is on; it overrides `language` for transcribe and fixes the ASR source for translate (empty = auto)
+  AudioFormat output_audio_format = 14; // format the gateway's egress accepts in RecognitionResult.audio_payload, from its
+                                        // media.codec: absent/LEGACY_ENCODED = already encoded for the session codec, today
+                                        // only G.711 PCMU 8 kHz (codec pcm; the gateway offers PCMU only), PCM_S16LE =
+                                        // raw PCM 16 kHz (codec g722 | l16). The gateway sends it on every chunk, fixed
+                                        // for a stream; this engine does not check that yet (speech_to_text ignores it;
+                                        // noise_reduction must lock it at the first chunk, see the design doc)
 }
 
 message RecognitionResult {
@@ -40,13 +49,17 @@ message RecognitionResult {
   float  confidence     = 7;
   string language       = 8;
   uint64 seq            = 9;
-  bytes  audio_payload  = 10; // G.711 payload bytes; gateway packetizes RTP
-  uint32 audio_pt       = 11; // 0=PCMU, 8=PCMA
+  bytes  audio_payload  = 10; // audio for MF, in the format of audio_format (15); gateway packetizes RTP
+  uint32 audio_pt       = 11; // LEGACY_ENCODED only: 0 = PCMU (the gateway sends G.711 as PT 0, so only PCMU is valid)
 
   // --- gateway fields for the keyword task; never set by this engine ---
   TopicLabel topic_label = 12;
   string     topic_info  = 13;
   float      topic_score = 14;
+
+  // --- gateway audio format (tags 15-16); must match AudioChunk.output_audio_format or the gateway drops the audio ---
+  AudioFormat audio_format      = 15; // absent/LEGACY_ENCODED = audio_payload is G.711 PCMU; PCM_S16LE = raw PCM16 LE mono
+  int32       audio_sample_rate = 16; // PCM_S16LE only; absent/0 = 16000, any other value is rejected by the gateway
 
   // --- engine extension (tags 20-24) ---
   uint64       utterance_id = 20; // starts at 1 and advances after each FINAL; all PARTIALs up to a FINAL carry its id.
@@ -57,6 +70,12 @@ message RecognitionResult {
   CommitReason reason       = 23; // FINAL only: why the utterance was committed
   ResultStatus status       = 24; // reserved: always RESULT_STATUS_OK today (a failed utterance produces no FINAL
                                   // and is logged by the engine)
+}
+
+// Same values as the gateway's enum.
+enum AudioFormat {
+  LEGACY_ENCODED = 0;
+  PCM_S16LE      = 1;
 }
 
 // Same values as the gateway's enum.
