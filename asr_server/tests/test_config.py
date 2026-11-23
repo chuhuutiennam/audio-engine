@@ -39,7 +39,8 @@ NEW_DEFAULTS = dict(ingress_max_ms=3000, audio_timeout_ms=2000, asr_max_consecut
                     word_reveal_enabled=False, word_reveal_window_ms=400, word_reveal_min_interval_ms=120,
                     # task noise_reduction (DPDFNet-2), off by default; speech_to_text stays on
                     asr_enabled=True, noise_enabled=False, noise_model='/opt/models/dpdfnet2.onnx',
-                    noise_frame_ms=20, noise_num_threads=1, noise_workers=2, noise_max_streams=16)
+                    noise_frame_ms=20, noise_num_threads=1, noise_workers=2, noise_max_streams=16,
+                    noise_max_backlog_ms=500)
 ALL_DEFAULTS = {**FORMER_CLI_DEFAULTS, **NEW_DEFAULTS}
 
 
@@ -87,9 +88,10 @@ def test_noise_reduction_is_read_from_its_section(tmp_path):
     s = load_settings(write(tmp_path, (
         'asr:\n  enabled: false\n'
         'noise_reduction:\n  enabled: true\n  model: /m/dpdfnet2.onnx\n  frame_ms: 40\n'
-        '  num_threads: 2\n  workers: 4\n  max_streams: 8\n')))
+        '  num_threads: 2\n  workers: 4\n  max_streams: 8\n  max_backlog_ms: 0\n')))
     assert (s.asr_enabled, s.noise_enabled, s.noise_model, s.noise_frame_ms, s.noise_num_threads,
-            s.noise_workers, s.noise_max_streams) == (False, True, '/m/dpdfnet2.onnx', 40, 2, 4, 8)
+            s.noise_workers, s.noise_max_streams, s.noise_max_backlog_ms) == \
+        (False, True, '/m/dpdfnet2.onnx', 40, 2, 4, 8, 0)
 
 
 def test_noise_reduction_limits_apply_only_when_enabled(tmp_path):
@@ -150,6 +152,8 @@ def test_values_and_overrides(tmp_path):
     'noise_reduction:\n  workers: 0\n',
     'noise_reduction:\n  max_streams: 0\n',
     'noise_reduction:\n  max_stream: 4\n',
+    'noise_reduction:\n  max_backlog_ms: -1\n',
+    'noise_reduction:\n  max_backlog_ms: 5001\n',
     # gRPC would refuse the extra RPCs before the denoiser pool does
     'server:\n  max_streams: 8\nnoise_reduction:\n  enabled: true\n',
     '- not\n- a mapping\n',

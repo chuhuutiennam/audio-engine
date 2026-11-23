@@ -20,7 +20,7 @@ from asr_server.noise_service import NoiseReductionService
 from asr_server.proto import speech_pb2_grpc
 
 from test_denoise import FakeDenoiser
-from test_noise_grpc import DATA, noise_chunks
+from test_noise_grpc import DATA, SlowDenoiser, noise_chunks
 from test_regression import make_service
 from test_speech_grpc import ONE, as_stream, chunks
 
@@ -73,8 +73,10 @@ def fake_asr(monkeypatch):
 def settings(tmp_path, **values):
     model = tmp_path / 'dpdfnet2.onnx'
     model.write_bytes(b'onnx')
+    # noise_max_backlog_ms 0: the tests send their audio at once, which the limit is meant to refuse
     base = dict(host='127.0.0.1', port=free_port(), model=str(tmp_path), punct_model=str(tmp_path),
-                vad_backend='webrtc', noise_model=str(model), noise_max_streams=2)
+                vad_backend='webrtc', noise_model=str(model), noise_max_streams=2,
+                noise_max_backlog_ms=0)
     base.update(values)
     return Settings(**base)
 
@@ -88,11 +90,13 @@ async def with_running_server(s, check):
             if task.done():
                 task.result()                       # serve() failed: raise its error
             assert ready.done(), 'server did not start'
-            await check(speech_pb2_grpc.SpeechStreamStub(channel))
+            # Bounded: a full-suite run once hung in a test of this file (not reproduced since);
+            # a hang now fails with the place it happened.
+            await asyncio.wait_for(check(speech_pb2_grpc.SpeechStreamStub(channel)), 60)
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, 30)        # server.stop() itself waits at most 5 s
 
 
 async def status_of(stub, messages):
@@ -128,6 +132,27 @@ def test_both_tasks_on_one_server(tmp_path, fake_denoisers, fake_asr):
         await noise_ok(stub)
         stt = [r async for r in stub.Recognize(as_stream(chunks(ONE)))]
         assert stt[-1].is_final and stt[-1].text
+    asyncio.run(with_running_server(s, check))
+
+
+def test_serve_applies_the_configured_backlog_limit(tmp_path, no_asr, monkeypatch):
+    # review L4: max_backlog_ms of server.yaml was not passed on (every stream got 500).
+    # The model must be slower than the audio: over gRPC the chunks arrive one by one, and a
+    # fast model takes each one before the next arrives, so no backlog builds up.
+    monkeypatch.setattr(denoise, 'dpdfnet2_factory', lambda model, num_threads: SlowDenoiser)
+    s = settings(tmp_path, asr_enabled=False, noise_enabled=True, noise_max_backlog_ms=200)
+
+    async def check(stub):
+        # 5 chunks at once; the first takes 200 ms in the model, so 3 chunks (240 ms) wait when
+        # the second is taken. Few enough that the client has sent them all before the RPC ends
+        # (a client still writing would see INTERNAL).
+        try:
+            [r async for r in stub.Recognize(as_stream(noise_chunks()[:5]))]
+        except grpc.aio.AioRpcError as err:
+            assert err.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+            assert 'max_backlog_ms 200' in err.details()
+            return
+        raise AssertionError('expected RESOURCE_EXHAUSTED')
     asyncio.run(with_running_server(s, check))
 
 

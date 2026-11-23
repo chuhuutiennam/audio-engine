@@ -221,14 +221,31 @@ stream; another value than `LEGACY_ENCODED` / `PCM_S16LE`, or a change, is
   next stream.
 - The model runs on `noise_reduction.workers` threads shared by all streams; the
   calls of one stream run one at a time, in order.
+- Chunks are read as they arrive. When more than `noise_reduction.max_backlog_ms`
+  (500) of audio waits for the model, i.e. the CPU does not keep up, the stream ends
+  with `RESOURCE_EXHAUSTED` (`noise_reduction backlog` WARNING) and the gateway plays
+  the original audio for the rest of the call, instead of getting ever later audio
+  that it would still accept. The limit is checked as each chunk is read, against
+  the chunks not yet given to the model: while one chunk is in the model, a burst of
+  7 chunks of 80 ms (6 waiting, 480 ms) passes and 8 do not. It also counts a
+  gateway that reads the results slowly. `0` turns the limit off (at most 5000); set
+  it on a test server whose client sends faster than real time. Whatever the limit,
+  at most 64 chunks are read ahead; gRPC flow control holds back the rest. A gateway
+  with `noise_reduction.on_ai_failure: close` retries `RESOURCE_EXHAUSTED` up to
+  `ai.max_retry` times, then closes the session.
+- A chunk above 64 KB ends the stream with `RESOURCE_EXHAUSTED`, as for
+  `speech_to_text`.
 - A model error ends the stream with `UNAVAILABLE`, and that denoiser is replaced by
   a newly loaded one.
 - One INFO line per stream when it ends: `noise_reduction stream ended ...
-  outcome=final|cancelled|invalid|model_error output=pcm_s16le|pcmu chunks= samples_in=
+  outcome=final|cancelled|invalid|model_error|backlog|read_error output=pcm_s16le|pcmu chunks= samples_in=
   samples_out= samples_sent= clipped= results= first_audio_ms= model_ms_p50=
-  model_ms_p95= model_ms_max= queue_ms_p95= queue_ms_max= chunk_seq_gaps=`.
+  model_ms_p95= model_ms_max= queue_ms_p95= queue_ms_max= backlog_ms_max=
+  chunk_seq_gaps=`.
   `model_ms` is the model time per chunk, `queue_ms` the wait for a free worker
   thread: a growing `queue_ms` means too few `workers` for the streams.
+  `backlog_ms_max` is the most audio that waited for the model; `outcome=backlog`
+  when it went above `max_backlog_ms`.
 
 Measured on a laptop CPU (sherpa-onnx 2.0.2, one ONNX thread per denoiser): first
 audio 16 ms after the first chunk, 13-21 ms of model time per 80 ms chunk, the same
@@ -241,7 +258,7 @@ output whatever the chunk size. Measure on the target CPU before choosing
 |---|---|
 | `INVALID_ARGUMENT` | Missing ids, bad `sample_rate`/`channels`, unknown `task`, odd `pcm` length, a session field changed; `noise_reduction`: unknown `output_audio_format` |
 | `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword` or `voice_controller_emoji`, or a task that is off (`noise_reduction.enabled` / `asr.enabled` false) |
-| `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB; `noise_reduction`: all denoisers in use |
+| `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB; `noise_reduction`: all denoisers in use, or more than `noise_reduction.max_backlog_ms` of audio waiting for the model |
 | `UNAVAILABLE` | `asr.max_consecutive_errors` model failures in a row; `noise_reduction`: the denoiser failed |
 
 What the gateway does with them: `INVALID_ARGUMENT` and `UNIMPLEMENTED` are

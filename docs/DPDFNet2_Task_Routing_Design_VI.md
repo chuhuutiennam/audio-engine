@@ -264,6 +264,7 @@ noise_reduction:
   num_threads: 1
   workers: 2
   max_streams: 16            # vượt ⇒ RESOURCE_EXHAUSTED ngay khi mở stream (không xếp hàng, xem §5.5)
+  max_backlog_ms: 500        # audio chờ model vượt mức này ⇒ đóng stream RESOURCE_EXHAUSTED; 0 = tắt
 ```
 
 **Không có khóa định dạng đầu ra** (`output_format`/`output_pt` của bản 1.0 đã bỏ): định dạng lấy theo từng stream từ `AudioChunk.output_audio_format`. **Đã có** trong `config.py` (nhánh `feature/noise-reduction`) với các khóa trên, trừ `model` mặc định là `/opt/models/dpdfnet2.onnx` (`update.sh` đổi thành `APP/model` cho máy cài mới) và `noise_reduction.enabled` mặc định `false`; kiểm tra lúc nạp: bật ít nhất một task, `frame_ms` ∈ {20, 40, 80}, `max_streams` ≤ `server.max_streams`. Engine không có configmap K8s; cấu hình chỉ ở `config/server.yaml` của thư mục chạy, `--check-config` in ra các khóa; `bin/env.sh` không cần biến mới. Có thể đặt `asr.enabled=false` để triển khai chỉ DPDFNet-2 trên CPU. `max_streams` và `workers` phải chọn theo đo p99 độ trễ < `fallback_after_ms` của Gateway, không phải số cuộc gọi đồng thời đã được kiểm nghiệm.
@@ -294,6 +295,7 @@ noise_reduction:
 | Vượt giới hạn số stream | `RESOURCE_EXHAUSTED` ngay khi mở stream | Thử lại theo `ai.max_retry`; quá `fallback_after_ms` hoặc hết lượt ⇒ FALLBACK, phát audio gốc |
 | Model không khởi tạo được / inference lỗi | `UNAVAILABLE`, ghi log và metric | Như trên; cuộc gọi không bị đóng |
 | AI chậm/treo (không trả audio ≥ 500 ms) | — | FALLBACK `stalled`, hủy stream AI (AI nhận cancel) |
+| CPU không theo kịp: audio chờ model > `noise_reduction.max_backlog_ms` (500) | `RESOURCE_EXHAUSTED`, log `noise_reduction backlog` | Stream kết thúc ⇒ FALLBACK, phát audio gốc (thay vì nhận audio ngày càng trễ mà vẫn coi là khỏe) |
 | Format Gateway và AI không khớp | — | Không phát RTP sai định dạng; cảnh báo và tăng `media_ai_egress_audio_rejected_total{reason}`. Vì vẫn tính là đã trả audio nên **không** kích hoạt FALLBACK: MF nhận im lặng ⇒ phải bắt bằng test field 14 |
 | EOS sạch | Flush model, phát phần đuôi và một final rỗng | Session đã `CLOSING`: bỏ audio đuôi (chấp nhận, §5.3) |
 | Hủy cưỡng bức / mất mạng | Giải phóng tài nguyên ngay; không chờ vô hạn | — |
@@ -336,7 +338,7 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 | AI task router | Chunk đầu chọn task: `noise_reduction` ⇒ `NoiseReductionService` khi bật; STT không đổi (toàn bộ test STT cũ vẫn qua); `asr.enabled=false` ⇒ STT `UNIMPLEMENTED` (`29e08ed`) | — |
 | AI DPDFNet-2 | `denoise.py`: pool nạp sẵn, `NoiseStream` hai đường ra theo field 14, khung `frame_ms`, µ-law, hạ mẫu FIR (`e1dff04`); nạp model trong `serve()` (L4). Model thật: audio đầu tiên 16 ms, model 13–21 ms mỗi chunk 80 ms (CPU laptop, 1 luồng) | Đo trên CPU máy chủ để chọn `max_streams`/`workers`; đánh giá chất lượng trên thoại thật |
 | AI protobuf | **Đã đồng bộ** tag 14/15/16 + `AudioFormat`, sinh lại `speech_pb2.py` (2 bản), test `tests/test_proto_contract.py` (23/11/2026, chưa commit) | — |
-| AI gRPC result | `noise_service.py`: audio mọi chunk, `ts_end` theo §4 ràng buộc 6, một final rỗng, mã lỗi §8, một dòng log tóm tắt mỗi stream (`29e08ed`) | Chặn backlog khi CPU không theo kịp (L5) |
+| AI gRPC result | `noise_service.py`: audio mọi chunk, `ts_end` theo §4 ràng buộc 6, một final rỗng, mã lỗi §8, một dòng log tóm tắt mỗi stream (`29e08ed`); chặn backlog `max_backlog_ms` (L5) | — |
 | Config và client | Khóa §7.2 trong `config.py`, `config/server.yaml`, README, `HUONG_DAN_CAI_DAT.md` (`22c7e09`, L4) | `scripts/update.sh` còn luôn đòi model ASR và chưa kiểm tra `noise_model` (chờ duyệt); client test `scripts/client.py` và `tools/eval` chưa gửi `noise_reduction` |
 | End-to-end | Mock AI wideband + fallback đã chạy thật phía Gateway | Dùng checkpoint DPDFNet-2 thật, stress/gap/cancel và kiểm thử chất lượng |
 
@@ -368,6 +370,7 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 - Đã code `noise_reduction` theo tài liệu: cấu hình (`22c7e09`), lõi DPDFNet-2 (`e1dff04`), RPC + định tuyến (`29e08ed`), nạp model trong `serve()` và test model thật (L4).
 - Pool bộ lọc nạp sẵn (đo: nạp 0,24–0,36 s, ~20 MB mỗi bộ; `reset()` cho kết quả giống bộ mới); bộ lọc lỗi được nạp lại.
 - Hạ mẫu 16→8 kHz bằng FIR tự viết thay `soxr` (soxr dạng stream trả mẫu theo đợt).
+- L5: chunk được đọc ngay khi tới vào hàng đợi; audio chờ model vượt `noise_reduction.max_backlog_ms` (mặc định 500, 0 = tắt) ⇒ `RESOURCE_EXHAUSTED`. Chọn 500 (không phải 300): ngắt nhầm mất khử nhiễu đến hết cuộc gọi (fallback một chiều), Gateway có thể gửi dồn 4–5 chunk sau một lần nghẽn, và 500 trùng `fallback_after_ms`.
 - Đo trên model thật: giữ lại 160 mẫu, `flush` trả nốt, tổng ra = tổng vào, độ trễ 40 ms, kết quả không phụ thuộc kích thước chunk.
 
 **1.1 — 23/11/2026** (đối chiếu code Gateway `feature/noise-reduction-service` HEAD `eeeb905`; quyết định do người dùng chốt cùng ngày):

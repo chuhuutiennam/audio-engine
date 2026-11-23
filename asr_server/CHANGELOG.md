@@ -10,8 +10,10 @@
   at the end of the stream; `ts_end` is the `rtp_timestamp` of the latest chunk given to the
   model. Denoisers are loaded at start (`noise_reduction.max_streams`); with none free a stream
   gets `RESOURCE_EXHAUSTED` at once. One `noise_reduction stream ended` INFO line per stream.
+  When more than `noise_reduction.max_backlog_ms` (500) of audio waits for the model, the stream
+  ends with `RESOURCE_EXHAUSTED` so that the gateway plays the original audio.
   New keys in `config/server.yaml`: `noise_reduction.enabled`, `model`, `frame_ms`,
-  `num_threads`, `workers`, `max_streams`. Needs `sherpa-onnx==2.0.2` and `dpdfnet2.onnx`.
+  `num_threads`, `workers`, `max_streams`, `max_backlog_ms`. Needs `sherpa-onnx==2.0.2` and `dpdfnet2.onnx`.
   Design: `docs/DPDFNet2_Task_Routing_Design_VI.md` at the repo root.
 - `asr.enabled` (default `true`): `false` loads no ASR, VAD or punctuation model and answers
   `speech_to_text` with `UNIMPLEMENTED`, for a CPU server that only denoises.

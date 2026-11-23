@@ -75,3 +75,6 @@ noise_reduction:             # task noise_reduction: DPDFNet-2 on CPU, audio bac
   max_streams: 16            # denoisers loaded at start (~20 MB each); one more stream ->
                              # RESOURCE_EXHAUSTED. Not above server.max_streams. Choose it from a
                              # measurement on the target CPU, not from the number of calls
+  max_backlog_ms: 500        # more audio than this waiting for the model (the CPU does not keep up):
+                             # the stream ends with RESOURCE_EXHAUSTED and the gateway plays the
+                             # original audio for the rest of the call. 0 = no limit, at most 5000

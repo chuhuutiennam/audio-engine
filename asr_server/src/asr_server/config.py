@@ -72,6 +72,7 @@ class Settings:
     noise_num_threads: int = 1                # ONNX threads of each denoiser
     noise_workers: int = 2                    # threads that run the denoisers of all streams
     noise_max_streams: int = 16               # denoisers loaded at start; one per stream
+    noise_max_backlog_ms: int = 500           # audio waiting for the model; above it the stream ends
 
     @property
     def word_reveal(self):
@@ -132,6 +133,7 @@ _KEYS = {
     ('noise_reduction', 'num_threads'): 'noise_num_threads',
     ('noise_reduction', 'workers'): 'noise_workers',
     ('noise_reduction', 'max_streams'): 'noise_max_streams',
+    ('noise_reduction', 'max_backlog_ms'): 'noise_max_backlog_ms',
 }
 _SECTIONS = sorted({section for section, _ in _KEYS})
 _TYPES = {f.name: f.type for f in fields(Settings)}
@@ -211,6 +213,8 @@ def _validate(s: Settings):
         raise ConfigError('noise_reduction.frame_ms must be 20, 40 or 80')
     if s.noise_num_threads < 1 or s.noise_workers < 1 or s.noise_max_streams < 1:
         raise ConfigError('noise_reduction.num_threads, workers and max_streams must be >= 1')
+    if not 0 <= s.noise_max_backlog_ms <= 5000:
+        raise ConfigError('noise_reduction.max_backlog_ms must be between 0 (off) and 5000')
     if s.noise_enabled and s.noise_max_streams > s.max_streams:
         raise ConfigError('noise_reduction.max_streams must not be above server.max_streams')
 

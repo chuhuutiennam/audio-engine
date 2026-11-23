@@ -8,6 +8,7 @@ Expected on sherpa-onnx 2.0.2 with dpdfnet2.onnx (SHA-256 ce35d602...87a9): one 
 back, flush() returns it, 40 ms algorithmic delay, the same output for any chunk size.
 """
 import asyncio
+import itertools
 import logging
 import os
 
@@ -101,7 +102,9 @@ def test_grpc_stream_with_the_real_model_and_its_log_line(caplog):
                               task='noise_reduction', output_audio_format=pb.AudioFormat.PCM_S16LE,
                               end_of_stream=n == len(pieces) - 1)
                 for n, piece in enumerate(pieces)]
-    svc = NoiseReductionService(DenoiserPool(dpdfnet2_factory(MODEL), 2), frame_ms=20, workers=2)
+    # max_backlog_ms 0: the whole 3 s is sent at once
+    svc = NoiseReductionService(DenoiserPool(dpdfnet2_factory(MODEL), 2), frame_ms=20, workers=2,
+                                max_backlog_ms=0)
     log = []
 
     async def logged():
@@ -124,8 +127,9 @@ def test_grpc_stream_with_the_real_model_and_its_log_line(caplog):
     outs = [value for kind, value in log if kind == 'out']
     assert [r.is_final for r in outs].count(True) == 1 and outs[-1].is_final
     assert sum(len(r.audio_payload) for r in outs) == len(pcm)
-    kinds = [kind for kind, _ in log]
-    assert all(kinds[i + 1] == 'out' for i, kind in enumerate(kinds[:-1]) if kind == 'in')
+    # in chunk order, each result carries the rtp_timestamp of the chunk just given to the model
+    stamps = [ts for ts, _ in itertools.groupby(r.ts_end for r in outs[:-1])]
+    assert stamps == [m.rtp_timestamp for m in messages]
     line = [r.getMessage() for r in caplog.records if 'noise_reduction stream ended' in r.getMessage()]
     print('\n' + line[0])
     fields = dict(item.split('=', 1) for item in line[0].split() if '=' in item)

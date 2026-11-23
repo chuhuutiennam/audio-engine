@@ -13,7 +13,10 @@ for noise_reduction.fallback_after_ms (500 ms) or ends with an error (section 5.
 - is_final once, on an empty result after end_of_stream or the client's half-close and the
   model flush. A cancelled RPC gets no final;
 - each stream borrows a denoiser from the pool; none free = RESOURCE_EXHAUSTED at once.
-  A model error ends the stream with UNAVAILABLE.
+  A model error ends the stream with UNAVAILABLE;
+- chunks are read as they arrive into a queue; when more than max_backlog_ms of audio waits
+  there for the model (the CPU does not keep up), the stream ends with RESOURCE_EXHAUSTED
+  instead of returning ever later audio that the gateway would still accept.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +35,10 @@ LOG = logging.getLogger('qwen3_asr.grpc.noise')
 SAMPLE_RATE = 16000
 # speech.proto AudioFormat (PCM_S16LE = 1), not messages.PCM_S16LE (= 3) of the speech_to_text core.
 OUTPUTS = {pb.AudioFormat.LEGACY_ENCODED: OUTPUT_PCMU, pb.AudioFormat.PCM_S16LE: OUTPUT_PCM16}
+MAX_CHUNK_BYTES = 64000             # as speech_to_text (server.py): 2 s of audio
+# Chunks read ahead at most, whatever max_backlog_ms says (0 = no limit): further chunks stay
+# with gRPC, whose flow control then holds the client back.
+MAX_QUEUED_CHUNKS = 64
 
 
 class ModelFailure(Exception):
@@ -42,6 +49,20 @@ class ModelFailure(Exception):
     def __init__(self, message, broken=True):
         super().__init__(message)
         self.broken = broken
+
+
+class Backlog(Exception):
+    """More audio waits for the model than noise_reduction.max_backlog_ms: RESOURCE_EXHAUSTED."""
+
+
+_EOF = object()                             # the client half-closed the request stream
+
+
+class _ReadError:
+    """Reading the request stream raised; the stream ends with that error."""
+
+    def __init__(self, exc):
+        self.exc = exc
 
 
 class _Histogram:
@@ -80,15 +101,22 @@ class _State:
         self.first_audio_ms = None
         self.model_ms = _Histogram()        # time in the model
         self.queue_ms = _Histogram()        # time waiting for a worker thread
+        self.waiting_samples = 0            # audio received and not yet given to the model
+        self.backlog_ms_max = 0
+        self.backlog = None                 # set by the reader when max_backlog_ms is passed
+        self.slots = asyncio.Semaphore(MAX_QUEUED_CHUNKS)
 
 
 class NoiseReductionService:
-    def __init__(self, pool, *, frame_ms=20, workers=2):
+    def __init__(self, pool, *, frame_ms=20, workers=2, max_backlog_ms=500):
+        """`max_backlog_ms`: audio allowed to wait for the model per stream; 0 = no limit."""
         if frame_ms not in FRAME_MS:
             raise ValueError(f'frame_ms must be one of {FRAME_MS}, got {frame_ms}')
         self.pool = pool
         self.frame_ms = frame_ms
+        self.max_backlog_ms = max_backlog_ms
         self.refused = 0                    # streams refused because no denoiser was free
+        self.backlogged = 0                 # streams ended by max_backlog_ms
         # Model calls of all streams; those of one stream run one at a time (each is awaited).
         # Loading a denoiser in place of a dropped one runs here too.
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='denoise')
@@ -126,6 +154,8 @@ class NoiseReductionService:
         if len(chunk.pcm) % 2:
             raise ProtocolError(grpc.StatusCode.INVALID_ARGUMENT,
                                 'pcm length must be a multiple of 2 (16-bit samples)')
+        if len(chunk.pcm) > MAX_CHUNK_BYTES:
+            raise ProtocolError(grpc.StatusCode.RESOURCE_EXHAUSTED, 'audio chunk above 64 KB')
         if state.next_chunk_seq is not None:
             if chunk.chunk_seq != state.next_chunk_seq:
                 # Chunks dropped by the gateway's send queue: the audio is lost, the stream goes on.
@@ -135,6 +165,42 @@ class NoiseReductionService:
                                 'this stream); processing goes on', state.session_id, state.stream_id,
                                 state.next_chunk_seq, chunk.chunk_seq, state.chunk_seq_gaps)
             state.next_chunk_seq = chunk.chunk_seq + 1
+
+    async def _read(self, request_iterator, queue, state):
+        """Move the chunks into `queue` as they arrive, so that the audio waiting to be processed
+        is known: unread, it would wait unseen in the gRPC buffers. Stops after end_of_stream, at
+        max_backlog_ms (the stream then ends at its next chunk), and waits while
+        MAX_QUEUED_CHUNKS are queued. Always leaves an item that ends the stream's wait."""
+        try:
+            async for chunk in request_iterator:
+                await state.slots.acquire()
+                state.waiting_samples += len(chunk.pcm) // 2
+                waiting_ms = state.waiting_samples * 1000 // SAMPLE_RATE
+                state.backlog_ms_max = max(state.backlog_ms_max, waiting_ms)
+                queue.put_nowait(chunk)
+                if self.max_backlog_ms and waiting_ms > self.max_backlog_ms:
+                    state.backlog = (f'{waiting_ms} ms of audio waiting to be processed, above '
+                                     f'noise_reduction.max_backlog_ms {self.max_backlog_ms}')
+                    return
+                if chunk.end_of_stream:
+                    return
+        except BaseException as exc:        # handed to the stream, which ends with it
+            queue.put_nowait(_ReadError(exc))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return
+        queue.put_nowait(_EOF)
+
+    @staticmethod
+    def _take(state, item):
+        """The next chunk out of the queue, or None at the half-close."""
+        if state.backlog is not None:
+            raise Backlog(state.backlog)
+        if item is _EOF:
+            return None
+        state.slots.release()
+        state.waiting_samples -= len(item.pcm) // 2
+        return item
 
     # ----------------------------------------------------------------- output
     @staticmethod
@@ -216,11 +282,15 @@ class NoiseReductionService:
                                 f'noise_reduction: all {self.pool.size} denoisers are in use')
             return
         stream = None
+        reader = None
         outcome = 'cancelled'
         broken = False
         try:
             stream = NoiseStream(denoiser, output=OUTPUTS[state.output_audio_format],
                                  frame_ms=self.frame_ms)
+            queue = asyncio.Queue()
+            if not first.end_of_stream:
+                reader = asyncio.create_task(self._read(request_iterator, queue, state))
             chunk = first
             end_ts = None
             while True:
@@ -232,7 +302,11 @@ class NoiseReductionService:
                 if chunk.end_of_stream:
                     end_ts = chunk.rtp_timestamp
                     break
-                chunk = await anext(request_iterator, None)
+                item = await queue.get()
+                if isinstance(item, _ReadError):
+                    outcome = 'read_error'
+                    raise item.exc
+                chunk = self._take(state, item)
                 if chunk is None:           # half-close
                     break
                 self._check(state, chunk)
@@ -253,11 +327,23 @@ class NoiseReductionService:
             LOG.error('noise_reduction model failed session=%s stream=%s: %s',
                       state.session_id, state.stream_id, exc)
             await context.abort(grpc.StatusCode.UNAVAILABLE, 'noise_reduction model failed')
+        except Backlog as exc:
+            outcome = 'backlog'
+            self.backlogged += 1
+            if self.backlogged <= 3 or self.backlogged % 100 == 0:
+                LOG.warning('noise_reduction backlog session=%s stream=%s: %s; stream closed '
+                            '(%d streams closed since start)', state.session_id, state.stream_id,
+                            exc, self.backlogged)
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, f'noise_reduction: {exc}')
         finally:
             try:
-                self._release(state, denoiser, broken)
+                if reader is not None:
+                    reader.cancel()
             finally:
-                self._summary(state, stream, outcome)
+                try:
+                    self._release(state, denoiser, broken)
+                finally:
+                    self._summary(state, stream, outcome)
 
     def _summary(self, state, stream, outcome):
         def count(name):
@@ -265,9 +351,9 @@ class NoiseReductionService:
         LOG.info('noise_reduction stream ended session=%s stream=%s outcome=%s output=%s chunks=%d '
                  'samples_in=%d samples_out=%d samples_sent=%d clipped=%d results=%d first_audio_ms=%s '
                  'model_ms_p50=%d model_ms_p95=%d model_ms_max=%.1f queue_ms_p95=%d queue_ms_max=%.1f '
-                 'chunk_seq_gaps=%d',
+                 'backlog_ms_max=%d chunk_seq_gaps=%d',
                  state.session_id, state.stream_id, outcome, OUTPUTS[state.output_audio_format],
                  state.chunks, count('samples_in'), count('samples_out'), count('samples_sent'),
                  count('clipped'), state.seq, state.first_audio_ms, state.model_ms.percentile(50),
                  state.model_ms.percentile(95), state.model_ms.max, state.queue_ms.percentile(95),
-                 state.queue_ms.max, state.chunk_seq_gaps)
+                 state.queue_ms.max, state.backlog_ms_max, state.chunk_seq_gaps)

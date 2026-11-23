@@ -4,8 +4,10 @@ The model is the stand-in of test_denoise.py (holds back 160 samples like DPDFNe
 level). Design: docs/DPDFNet2_Task_Routing_Design_VI.md, sections 4, 5 and 8.
 """
 import asyncio
+import itertools
 import logging
 import threading
+import time
 
 import grpc
 import numpy as np
@@ -44,8 +46,10 @@ def noise_chunks(data=DATA, *, fmt=pb.PCM_S16LE, chunk_bytes=CHUNK, rtp_start=10
     return out
 
 
-def noise_service(size=2, factory=FakeDenoiser, frame_ms=20):
-    return NoiseReductionService(DenoiserPool(factory, size), frame_ms=frame_ms, workers=2)
+def noise_service(size=2, factory=FakeDenoiser, frame_ms=20, max_backlog_ms=0):
+    # Most tests send all their audio at once, which the backlog limit is meant to refuse.
+    return NoiseReductionService(DenoiserPool(factory, size), frame_ms=frame_ms, workers=2,
+                                 max_backlog_ms=max_backlog_ms)
 
 
 def run_noise(messages, svc=None, core=None):
@@ -94,31 +98,14 @@ def test_pcm16_results_carry_the_denoised_audio_and_one_empty_final():
     assert [r.seq for r in out] == list(range(1, len(out) + 1))
 
 
-def test_audio_comes_back_for_every_chunk_with_ts_end_of_the_latest_chunk():
-    log = []
-
-    async def logged(messages):
-        for message in messages:
-            log.append(('in', message.rtp_timestamp))
-            yield message
-
-    async def go():
-        svc = noise_service()
-        try:
-            service = SpeechStreamService(None, noise=svc)
-            async for r in service.Recognize(logged(noise_chunks()), FakeContext()):
-                log.append(('out', r))
-        finally:
-            svc.close()
-    asyncio.run(go())
-    latest, outs_since_in = None, None
-    for kind, value in log:
-        if kind == 'in':
-            assert outs_since_in in (None, 3, 4)            # 1280 samples in -> 3 or 4 frames of 20 ms
-            latest, outs_since_in = value, 0
-        else:
-            assert value.ts_end == latest
-            outs_since_in += 1
+def test_audio_comes_back_for_every_chunk_with_ts_end_of_that_chunk():
+    messages = noise_chunks()
+    audio = run_noise(messages)[:-1]
+    # In chunk order, each result carries the rtp_timestamp of the chunk just given to the model.
+    groups = [(ts, len(list(results))) for ts, results in itertools.groupby(r.ts_end for r in audio)]
+    assert [ts for ts, _ in groups] == [m.rtp_timestamp for m in messages]
+    # 1280 samples in -> 3 frames of 20 ms the first time (160 held back by the model), then 4
+    assert [n for _, n in groups[:-1]] == [3] + [4] * (len(messages) - 2)
 
 
 # ------------------------------------------------------------------- G.711 PCMU
@@ -461,6 +448,210 @@ def test_final_not_taken_by_the_client_is_logged_as_cancelled(caplog):
     assert 'outcome=cancelled' in caplog.text
 
 
+# ----------------------------------------------------------------- backlog limit
+async def paced(messages, interval_s, burst=1):
+    """The messages at real-time pace; the first `burst` of them at once."""
+    for n, message in enumerate(messages):
+        yield message
+        if n + 1 >= burst:
+            await asyncio.sleep(interval_s)
+
+
+class SlowDenoiser(FakeDenoiser):
+    """200 ms of model time per call: 2.5 times slower than 80 ms chunks arrive."""
+
+    def run(self, samples, sample_rate):
+        time.sleep(0.2)
+        return super().run(samples, sample_rate)
+
+
+async def _outcome(service, requests):
+    try:
+        out = [r async for r in service.Recognize(requests, FakeContext())]
+    except Aborted as err:
+        return err.code, None
+    return grpc.StatusCode.OK, out
+
+
+def test_model_slower_than_real_time_ends_the_stream_at_the_backlog_limit(caplog):
+    svc = noise_service(size=1, factory=SlowDenoiser, max_backlog_ms=300)
+
+    async def go():
+        code, _ = await _outcome(SpeechStreamService(None, noise=svc), paced(noise_chunks(), 0.08))
+        await wait_until(lambda: svc.pool.free == 1)
+        return code
+    try:
+        with caplog.at_level(logging.INFO, logger='qwen3_asr.grpc.noise'):
+            assert asyncio.run(go()) == grpc.StatusCode.RESOURCE_EXHAUSTED
+    finally:
+        svc.close()
+    assert 'noise_reduction backlog session=call-1' in caplog.text
+    summary = [r.getMessage() for r in caplog.records if 'stream ended' in r.getMessage()][0]
+    assert 'outcome=backlog' in summary
+    assert int(summary.split('backlog_ms_max=')[1].split()[0]) > 300
+
+
+def test_real_time_client_with_a_fast_model_stays_under_the_limit():
+    svc = noise_service(max_backlog_ms=300)
+
+    async def go():
+        return await _outcome(SpeechStreamService(None, noise=svc), paced(noise_chunks(DATA[:16000]), 0.08))
+    try:
+        code, out = asyncio.run(go())
+    finally:
+        svc.close()
+    assert code == grpc.StatusCode.OK and out[-1].is_final
+
+
+@pytest.mark.parametrize('burst,code,backlog_ms', [(7, grpc.StatusCode.OK, 480),
+                                                   (8, grpc.StatusCode.RESOURCE_EXHAUSTED, 560)])
+def test_default_limit_and_a_burst_of_chunks(burst, code, backlog_ms, caplog):
+    # A gateway that stalled sends what it queued at once. While the first chunk is in the
+    # model, the others wait: 7 chunks -> 6 waiting = 480 ms, under 500; 8 -> 560 ms.
+    # (review L5: this test claimed 480 ms but measured 320)
+    svc = noise_service(max_backlog_ms=500)
+
+    async def go():
+        return await _outcome(SpeechStreamService(None, noise=svc),
+                              paced(noise_chunks(DATA[:2560 * 10]), 0.08, burst=burst))
+    try:
+        with caplog.at_level(logging.INFO, logger='qwen3_asr.grpc.noise'):
+            got, _ = asyncio.run(go())
+    finally:
+        svc.close()
+    assert got == code
+    summary = [r.getMessage() for r in caplog.records if 'stream ended' in r.getMessage()][0]
+    assert f'backlog_ms_max={backlog_ms} ' in summary
+
+
+def test_reading_stops_at_the_backlog_limit_while_the_model_is_busy():
+    # review L5 (important): all the client's audio was read into memory during one long model
+    # call; the limit was only checked between calls
+    read = []
+
+    async def fast_client():
+        for message in noise_chunks(DATA * 10):         # 10 s, sent as fast as possible
+            read.append(message.chunk_seq)
+            yield message
+    svc = noise_service(size=1, factory=BlockingDenoiser, max_backlog_ms=500)
+    model = svc.pool._free[0]
+
+    async def go():
+        task = asyncio.create_task(_outcome(SpeechStreamService(None, noise=svc), fast_client()))
+        await asyncio.to_thread(model.started.wait, 5)
+        await asyncio.sleep(0.2)                        # time enough to read everything
+        chunks_read = len(read)
+        model.go.set()
+        code, _ = await asyncio.wait_for(task, 10)
+        return chunks_read, code
+    try:
+        chunks_read, code = asyncio.run(go())
+    finally:
+        model.go.set()
+        svc.close()
+    assert code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert chunks_read <= 10                            # the first, 7 waiting (560 ms), and one more
+
+
+def test_without_a_limit_reading_still_stops_at_64_chunks():
+    # review L5: max_backlog_ms 0 must not mean unlimited memory; the client is held by gRPC
+    read = []
+
+    async def fast_client():
+        for message in noise_chunks(DATA * 10):
+            read.append(message.chunk_seq)
+            yield message
+    svc = noise_service(size=1, factory=BlockingDenoiser, max_backlog_ms=0)
+    model = svc.pool._free[0]
+
+    async def go():
+        task = asyncio.create_task(_outcome(SpeechStreamService(None, noise=svc), fast_client()))
+        await asyncio.to_thread(model.started.wait, 5)
+        await asyncio.sleep(0.2)
+        chunks_read = len(read)
+        model.go.set()
+        code, out = await asyncio.wait_for(task, 20)
+        return chunks_read, code, out
+    try:
+        chunks_read, code, out = asyncio.run(go())
+    finally:
+        model.go.set()
+        svc.close()
+    assert chunks_read <= 1 + 64 + 1
+    assert code == grpc.StatusCode.OK and sum(len(r.audio_payload) for r in out) == len(DATA) * 10
+
+
+def test_backlog_warnings_are_not_logged_one_by_one(caplog):
+    # review L5: under a CPU overload every stream logs at once
+    svc = noise_service(max_backlog_ms=100)
+
+    async def go():
+        service = SpeechStreamService(None, noise=svc)
+        for n in range(10):                             # 5 chunks at once: 320 ms waiting
+            code, _ = await _outcome(service, as_stream(noise_chunks(stream=f's{n}')[:5]))
+            assert code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    try:
+        with caplog.at_level(logging.WARNING, logger='qwen3_asr.grpc.noise'):
+            asyncio.run(go())
+    finally:
+        svc.close()
+    assert len([r for r in caplog.records if 'noise_reduction backlog' in r.getMessage()]) == 3
+
+
+class _ReaderKilled(BaseException):
+    pass
+
+
+def test_reader_ending_on_a_base_exception_does_not_leave_the_stream_waiting():
+    # review L5: the reader put nothing in the queue and the stream waited forever
+    async def killed():
+        for message in noise_chunks()[:2]:
+            yield message
+        raise _ReaderKilled()
+    svc = noise_service(size=1)
+
+    async def go():
+        stream = SpeechStreamService(None, noise=svc).Recognize(killed(), FakeContext())
+        await asyncio.wait_for(_drain_all(stream), 5)
+    try:
+        with pytest.raises(_ReaderKilled):
+            asyncio.run(go())
+        assert svc.pool.free == 1
+    finally:
+        svc.close()
+
+
+async def _drain_all(results):
+    return [r async for r in results]
+
+
+@pytest.mark.parametrize('index', [0, 2])
+def test_chunk_above_64kb_is_refused_as_for_speech_to_text(index):
+    # review L5: one huge chunk held a model thread for seconds, unseen by the backlog limit
+    assert noise_rejected(noise_chunks(mutate=_set(index, pcm=b'\x00' * 64002))) == \
+        grpc.StatusCode.RESOURCE_EXHAUSTED
+
+
+def test_error_while_reading_requests_ends_the_stream_and_frees_the_slot(caplog):
+    async def broken():
+        for message in noise_chunks()[:2]:
+            yield message
+        raise RuntimeError('connection reset')
+    svc = noise_service(size=1)
+
+    async def go():
+        [r async for r in SpeechStreamService(None, noise=svc).Recognize(broken(), FakeContext())]
+    try:
+        with caplog.at_level(logging.INFO, logger='qwen3_asr.grpc.noise'), \
+                pytest.raises(RuntimeError, match='connection reset'):
+            asyncio.run(go())
+        assert svc.pool.free == 1
+    finally:
+        svc.close()
+    # review L5: the outcome of the summary line was not checked
+    assert 'outcome=read_error' in caplog.text
+
+
 # -------------------------------------------------------------------------- routing
 def test_noise_reduction_is_unimplemented_when_the_service_is_off():
     service = SpeechStreamService(make_service())
@@ -560,3 +751,4 @@ def test_stream_summary_is_logged(caplog):
     assert 'outcome=final' in line[0] and 'samples_in=16000' in line[0] and 'samples_out=16000' in line[0]
     # review L3: time in the model and time waiting for a worker thread are told apart
     assert 'model_ms_p95=' in line[0] and 'queue_ms_p95=' in line[0] and 'samples_sent=16000' in line[0]
+    assert 'backlog_ms_max=' in line[0]

@@ -686,8 +686,10 @@ def _build_noise(args):
         LOG.error('noise_reduction cannot start: %s: %s', type(exc).__name__, exc)
         raise
     LOG.info('noise_reduction on: %d denoisers loaded in %.1f s, %d worker threads, %d ms of audio '
-             'per result', pool.size, time.monotonic() - started, args.noise_workers, args.noise_frame_ms)
-    return NoiseReductionService(pool, frame_ms=args.noise_frame_ms, workers=args.noise_workers)
+             'per result, max_backlog_ms=%d', pool.size, time.monotonic() - started,
+             args.noise_workers, args.noise_frame_ms, args.noise_max_backlog_ms)
+    return NoiseReductionService(pool, frame_ms=args.noise_frame_ms, workers=args.noise_workers,
+                                 max_backlog_ms=args.noise_max_backlog_ms)
 
 
 async def serve(args):
