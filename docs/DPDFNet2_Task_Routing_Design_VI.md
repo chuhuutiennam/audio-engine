@@ -1,6 +1,6 @@
 # THIẾT KẾ THỐNG NHẤT: AUDIO ENGINE TASK ROUTING VÀ DPDFNet-2 STREAMING 16 kHz
 
-**Phiên bản:** 1.1 — 23/11/2026 (1.0 → 1.1: đối chiếu code Gateway nhánh `feature/noise-reduction-service`, xem "Lịch sử thay đổi" cuối tài liệu)  
+**Phiên bản:** 1.2 — 23/11/2026 (1.1 → 1.2: AI Engine đã code `noise_reduction` trên nhánh `feature/noise-reduction`; 1.0 → 1.1: đối chiếu code Gateway nhánh `feature/noise-reduction-service`; xem "Lịch sử thay đổi" cuối tài liệu)  
 **Phạm vi:** Media Function (MF) ↔ RTP Gateway ↔ AI Audio Engine  
 **Giao thức AI:** `speech.SpeechStream/Recognize` — gRPC hai chiều  
 **Nguồn tổng hợp:** `DPDFNet2_Task_Routing_Design.md`, `wideband-codec-g722-l16-solution-v2-ai16k-VI.md`; code và tài liệu Gateway `media_ai` (nhánh `feature/noise-reduction-service`: `internal/ai/proto/speech.proto`, `docs/wideband-codec-g722-l16-solution.md`). File `speech_ai_wideband_v2.proposed.proto` mà bản 1.0 dẫn **không có trong repo**; proto hợp lệ là `media_ai/internal/ai/proto/speech.proto` (Gateway) và `asr_server/src/asr_server/proto/speech.proto` (AI, cùng tag).
@@ -22,7 +22,7 @@
 | `AudioChunk.task` | Pipeline | Kiểu kết quả | Trạng thái của Audio Engine nguồn |
 |---|---|---|---|
 | `speech_to_text` hoặc rỗng | VAD → Qwen3-ASR → punctuation | `RecognitionResult.text`, partial/final | Đã có, phải giữ nguyên |
-| **`noise_reduction`** | **DPDFNet-2 online → đóng gói audio** | `audio_payload` cùng `audio_format` | **Chưa có trong repo**: `asr_server` hiện trả `UNIMPLEMENTED` (`speech_service.py`, `OTHER_GATEWAY_TASKS`); cần viết theo tài liệu này |
+| **`noise_reduction`** | **DPDFNet-2 online → đóng gói audio** | `audio_payload` cùng `audio_format` | **Đã code** trên nhánh `feature/noise-reduction` (chưa merge): `noise_service.py`, `denoise.py`; bật bằng `noise_reduction.enabled` (mặc định tắt ⇒ `UNIMPLEMENTED`) |
 | `realtime_translation` | ASR → dịch | Chưa định nghĩa ở bản này | `UNIMPLEMENTED` |
 | `keyword` | Phát hiện từ khóa | Chưa định nghĩa ở bản này | `UNIMPLEMENTED` |
 | `voice_controller_emoji` | Phát hiện lệnh/emoji | Chưa định nghĩa ở bản này | `UNIMPLEMENTED` |
@@ -32,7 +32,7 @@
 
 ### 1.3. Phân biệt trạng thái triển khai và thiết kế
 
-- **Audio Engine:** bản `audio-engine-dpdfnet2-task-router.zip` (routing `noise_reduction` + DPDFNet-2, đầu ra G.711) **không có trong repo**. Nhánh hiện tại (`feature/word-reveal`, đã thêm word_reveal, force_language, upgrade/rollback) chưa có routing `noise_reduction`, chưa có khóa `asr.enabled` hay mục `noise_reduction` trong `config.py`. Proto AI đã đồng bộ tag 14/15/16 và enum `AudioFormat` (23/11/2026, chưa commit). Các bước sửa AI ở tài liệu này là **yêu cầu triển khai**, không phải chức năng đã xác nhận chạy thật.
+- **Audio Engine:** bản `audio-engine-dpdfnet2-task-router.zip` **không có trong repo**; `noise_reduction` được viết mới trên nhánh `feature/noise-reduction` (tạo từ `feature/word-reveal`, chưa merge): khóa `asr.enabled` và mục `noise_reduction` trong `config.py`, định tuyến theo task, DPDFNet-2 qua sherpa-onnx 2.0.2, hai đường ra theo field 14. Proto AI đã đồng bộ tag 14/15/16 (`1eacc31`). **Đã chạy** với model DPDFNet-2 thật trên CPU laptop qua client test (in-process và gRPC); **chưa chạy** với Gateway và MF thật, chưa đo trên CPU máy chủ, chưa đánh giá chất lượng trên thoại tiếng Việt.
 - **Gateway** (nhánh `feature/noise-reduction-service`, chưa merge `master`): đã có G.722/L16 + `audio_format` 15/16 (S1–S8); dịch vụ `noise_reduction` (`d84df2f`); fallback phát audio gốc khi AI lỗi (F1–F4, `e32bdd0`…`84f4ac5`); chờ có giới hạn trước khi bỏ result có audio (`e3d4ee5`, `7468676`, `da6b0fa`); đệm phát pacer (`f4687fa`, `eeeb905`); gửi `output_audio_format` field 14 (23/11/2026, chưa commit). Đã chạy thật với mock worker (log/pcap trong `wideband-codec-g722-l16-solution.md`); **chưa kiểm thử với MF thật**.
 - **Tích hợp:** chưa có kiểm thử end-to-end với **DPDFNet-2 checkpoint thật + Gateway wideband + MF RTP thật**. Không coi kiểm thử bằng mock worker là nghiệm thu chất lượng âm thanh.
 
@@ -153,7 +153,7 @@ Ràng buộc từ Gateway: mỗi result PCM nên mang **bội của 640 byte** (
 
 ### 5.2. Xử lý mỗi luồng
 
-1. Nhận `AudioChunk` đầu tiên, xác thực metadata và `task=noise_reduction`, kiểm tra giới hạn số stream; đọc `output_audio_format` (field 14) để chọn đường ra (`PCM_S16LE` ⇒ FIFO PCM16 16 kHz; vắng/`LEGACY_ENCODED` ⇒ resample 16→8 kHz có trạng thái + mã hóa **PCMU**, frame 160 byte); tạo **một** `sherpa_onnx.OnlineSpeechDenoiser` DPDFNet-2 riêng.
+1. Nhận `AudioChunk` đầu tiên, xác thực metadata và `task=noise_reduction`, kiểm tra giới hạn số stream; đọc `output_audio_format` (field 14) để chọn đường ra (`PCM_S16LE` ⇒ FIFO PCM16 16 kHz; vắng/`LEGACY_ENCODED` ⇒ resample 16→8 kHz có trạng thái + mã hóa **PCMU**, frame 160 byte); tạo **một** `sherpa_onnx.OnlineSpeechDenoiser` DPDFNet-2 riêng. Code: lấy một bộ lọc **nạp sẵn** từ pool (nạp một bộ mất ~0,3 s, quá lâu cho ngưỡng 500 ms; `reset()` khi trả về cho kết quả giống hệt bộ mới — đã đo). Hạ mẫu 16→8 kHz dùng bộ lọc FIR tự viết (`audio.Downsampler16kTo8k`, Kaiser 127 tap, phẳng tới 3300 Hz): `soxr` dạng stream trả mẫu theo đợt (có chunk 80 ms ra 0 mẫu), vi phạm "audio cho mọi chunk".
 2. Với mỗi chunk, giải mã little-endian PCM16 thành float32 chuẩn hóa `[-1, 1]`; giữ thứ tự input; gọi `denoiser.run(samples, 16000)`.
 3. Đọc mẫu đầu ra từ đối tượng kết quả của `run()`, chuyển thành PCM16 có clipping kiểm soát; cộng vào **output FIFO** của chính stream.
 4. Khi FIFO có từ 320 mẫu trở lên, trích ra mỗi khối 320 mẫu, phát `RecognitionResult(audio_format=PCM_S16LE, audio_sample_rate=16000, is_final=false, ts_end=<rtp_timestamp chunk vào mới nhất>)` ngay. Có thể gom 640 mẫu nếu cấu hình output 40 ms. Chế độ legacy: `audio_format=LEGACY_ENCODED`, `audio_pt=0`, payload PCMU 160 byte/20 ms.
@@ -266,7 +266,7 @@ noise_reduction:
   max_streams: 16            # vượt ⇒ RESOURCE_EXHAUSTED ngay khi mở stream (không xếp hàng, xem §5.5)
 ```
 
-**Không có khóa định dạng đầu ra** (`output_format`/`output_pt` của bản 1.0 đã bỏ): định dạng lấy theo từng stream từ `AudioChunk.output_audio_format`. Toàn bộ mục `noise_reduction` và khóa `asr.enabled` **chưa có trong `config.py`** của AI Engine; khi code phải thêm vào parser, `--check-config` và mọi nơi đặt cấu hình (`APP_DIR/etc`, `APP_DIR/config`, configmap, env). Có thể đặt `asr.enabled=false` để triển khai chỉ DPDFNet-2 trên CPU. `max_streams` và `workers` phải chọn theo đo p99 độ trễ < `fallback_after_ms` của Gateway, không phải số cuộc gọi đồng thời đã được kiểm nghiệm.
+**Không có khóa định dạng đầu ra** (`output_format`/`output_pt` của bản 1.0 đã bỏ): định dạng lấy theo từng stream từ `AudioChunk.output_audio_format`. **Đã có** trong `config.py` (nhánh `feature/noise-reduction`) với các khóa trên, trừ `model` mặc định là `/opt/models/dpdfnet2.onnx` (`update.sh` đổi thành `APP/model` cho máy cài mới) và `noise_reduction.enabled` mặc định `false`; kiểm tra lúc nạp: bật ít nhất một task, `frame_ms` ∈ {20, 40, 80}, `max_streams` ≤ `server.max_streams`. Engine không có configmap K8s; cấu hình chỉ ở `config/server.yaml` của thư mục chạy, `--check-config` in ra các khóa; `bin/env.sh` không cần biến mới. Có thể đặt `asr.enabled=false` để triển khai chỉ DPDFNet-2 trên CPU. `max_streams` và `workers` phải chọn theo đo p99 độ trễ < `fallback_after_ms` của Gateway, không phải số cuộc gọi đồng thời đã được kiểm nghiệm.
 
 **Ma trận định dạng (tự động theo field 14):**
 
@@ -333,11 +333,11 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 |---|---|---|
 | Gateway G.722/L16 + `noise_reduction` | Nhánh `feature/noise-reduction-service`: S1–S8, dịch vụ `noise_reduction`, fallback F1–F4, chờ result có audio, đệm phát pacer, gửi field 14 (chưa commit); chạy thật với mock worker | Merge `master`; lab MF thật; F5 (tự phục hồi giữa cuộc gọi) là việc riêng |
 | Gateway — điểm yếu đã biết | Bộ đếm treo được xóa khi nhận **bất kỳ** result có audio (`grpc_client.go:508-511`), kể cả audio sau đó bị egress từ chối vì sai định dạng | Nếu muốn: chỉ tính audio egress nhận được (việc của Gateway, chưa làm) |
-| AI task router | Chỉ `speech_to_text`; `noise_reduction` và 3 task khác trả `UNIMPLEMENTED` (sửa 23/11/2026, trước đó `noise_reduction` bị trả `INVALID_ARGUMENT`) | Thêm routing `noise_reduction`, không làm thay đổi STT |
-| AI DPDFNet-2 | **Chưa có trong repo** (zip thử nghiệm không có) | Viết denoiser theo stream, hai đường ra theo field 14 (PCM16 / PCMU), packetizer bội 20 ms, `ts_end`, final rỗng |
+| AI task router | Chunk đầu chọn task: `noise_reduction` ⇒ `NoiseReductionService` khi bật; STT không đổi (toàn bộ test STT cũ vẫn qua); `asr.enabled=false` ⇒ STT `UNIMPLEMENTED` (`29e08ed`) | — |
+| AI DPDFNet-2 | `denoise.py`: pool nạp sẵn, `NoiseStream` hai đường ra theo field 14, khung `frame_ms`, µ-law, hạ mẫu FIR (`e1dff04`); nạp model trong `serve()` (L4). Model thật: audio đầu tiên 16 ms, model 13–21 ms mỗi chunk 80 ms (CPU laptop, 1 luồng) | Đo trên CPU máy chủ để chọn `max_streams`/`workers`; đánh giá chất lượng trên thoại thật |
 | AI protobuf | **Đã đồng bộ** tag 14/15/16 + `AudioFormat`, sinh lại `speech_pb2.py` (2 bản), test `tests/test_proto_contract.py` (23/11/2026, chưa commit) | — |
-| AI gRPC result | Chưa có | Phát audio định dạng tường minh; một final rỗng sau flush |
-| Config và client | `config.py` chưa có `noise_reduction`/`asr.enabled`; client cũ nghe G.711 8 kHz | Thêm khóa (§7.2) ở mọi nơi đặt cấu hình; client gửi `output_audio_format`, lưu/đọc PCM16 16 kHz |
+| AI gRPC result | `noise_service.py`: audio mọi chunk, `ts_end` theo §4 ràng buộc 6, một final rỗng, mã lỗi §8, một dòng log tóm tắt mỗi stream (`29e08ed`) | Chặn backlog khi CPU không theo kịp (L5) |
+| Config và client | Khóa §7.2 trong `config.py`, `config/server.yaml`, README, `HUONG_DAN_CAI_DAT.md` (`22c7e09`, L4) | `scripts/update.sh` còn luôn đòi model ASR và chưa kiểm tra `noise_model` (chờ duyệt); client test `scripts/client.py` và `tools/eval` chưa gửi `noise_reduction` |
 | End-to-end | Mock AI wideband + fallback đã chạy thật phía Gateway | Dùng checkpoint DPDFNet-2 thật, stress/gap/cancel và kiểm thử chất lượng |
 
 **Quy trình triển khai đề xuất:** (1) ✅ đồng bộ protobuf; (2) config AI và routing; (3) denoiser + packetizer + final + `ts_end`; (4) test đơn vị và gRPC (gồm hợp đồng fallback §5.5); (5) test với Gateway G.722/L16 + PCMU bằng engine thật; (6) kiểm tra PCAP/RTF/QoE và triển khai có kiểm soát. Không coi tài liệu này là xác nhận source AI đã được cập nhật.
@@ -362,6 +362,13 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 **Kết luận thiết kế:** Một gRPC `SpeechStream.Recognize` phục vụ các task theo định tuyến tường minh. `speech_to_text` giữ nguyên. `noise_reduction` dùng DPDFNet-2 để trả audio **theo chunk bội 20 ms, liên tục cho mọi chunk**, theo định dạng Gateway yêu cầu ở `output_audio_format` (PCM16 16 kHz hoặc G.711 PCMU). Mỗi stream giữ state riêng và phát **một final rỗng duy nhất khi kết thúc**. Gateway dùng tag 15/16 để phân biệt PCM và G.711, mã hóa G.722/L16, phát RTP theo pacer, và phát audio gốc khi AI lỗi hoặc chậm quá `fallback_after_ms`. Đây là bản thiết kế duy nhất để cập nhật AI Engine và đối chiếu tích hợp Gateway trong giai đoạn tiếp theo.
 
 ## Lịch sử thay đổi
+
+**1.2 — 23/11/2026** (code AI Engine trên nhánh `feature/noise-reduction`):
+
+- Đã code `noise_reduction` theo tài liệu: cấu hình (`22c7e09`), lõi DPDFNet-2 (`e1dff04`), RPC + định tuyến (`29e08ed`), nạp model trong `serve()` và test model thật (L4).
+- Pool bộ lọc nạp sẵn (đo: nạp 0,24–0,36 s, ~20 MB mỗi bộ; `reset()` cho kết quả giống bộ mới); bộ lọc lỗi được nạp lại.
+- Hạ mẫu 16→8 kHz bằng FIR tự viết thay `soxr` (soxr dạng stream trả mẫu theo đợt).
+- Đo trên model thật: giữ lại 160 mẫu, `flush` trả nốt, tổng ra = tổng vào, độ trễ 40 ms, kết quả không phụ thuộc kích thước chunk.
 
 **1.1 — 23/11/2026** (đối chiếu code Gateway `feature/noise-reduction-service` HEAD `eeeb905`; quyết định do người dùng chốt cùng ngày):
 

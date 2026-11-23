@@ -4,6 +4,19 @@
 
 ### Added
 
+- Task `noise_reduction`: DPDFNet-2 speech denoising on CPU (sherpa-onnx 2.0.2
+  `OnlineSpeechDenoiser`), off by default. The audio goes back in every result as PCM16 16 kHz
+  or G.711 PCMU 8 kHz, as `AudioChunk.output_audio_format` (tag 14) asks; one empty `is_final`
+  at the end of the stream; `ts_end` is the `rtp_timestamp` of the latest chunk given to the
+  model. Denoisers are loaded at start (`noise_reduction.max_streams`); with none free a stream
+  gets `RESOURCE_EXHAUSTED` at once. One `noise_reduction stream ended` INFO line per stream.
+  New keys in `config/server.yaml`: `noise_reduction.enabled`, `model`, `frame_ms`,
+  `num_threads`, `workers`, `max_streams`. Needs `sherpa-onnx==2.0.2` and `dpdfnet2.onnx`.
+  Design: `docs/DPDFNet2_Task_Routing_Design_VI.md` at the repo root.
+- `asr.enabled` (default `true`): `false` loads no ASR, VAD or punctuation model and answers
+  `speech_to_text` with `UNIMPLEMENTED`, for a CPU server that only denoises.
+- `tests/test_noise_real_model.py` runs the real DPDFNet-2 model when
+  `ASR_TEST_DPDFNET2_MODEL` names it (skipped otherwise).
 - Word-by-word reveal of PARTIAL results, off by default. New keys in `config/server.yaml`:
   `word_reveal.enabled`, `word_reveal.window_ms`, `word_reveal.min_interval_ms`.
 - `bin/env.sh.example` sets the offline runtime variables and `CUDA_VISIBLE_DEVICES=0`. An existing

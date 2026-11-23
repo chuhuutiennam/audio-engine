@@ -17,7 +17,8 @@ asr_server/
 │                             run_tests.sh, client.py (demo client, speech.proto)
 ├── src/asr_server/           speech_service.py (gRPC, speech.proto), server.py (recognition core),
 │                             messages.py, asr_backend.py, vad.py, audio.py, punctuation.py,
-│                             text_clean.py, config.py, proto/ (speech.proto + bindings)
+│                             text_clean.py, config.py, proto/ (speech.proto + bindings),
+│                             noise_service.py + denoise.py (task noise_reduction, DPDFNet-2)
 ├── tests/                    server and deployment-script tests (no GPU or checkpoints needed)
 ├── tools/eval/               WER / VRAM evaluation client (eval_wav_grpc.py)
 ├── data/                     sample audio and ground truth for evaluation (not tracked)
@@ -36,6 +37,13 @@ Backends are chosen in `config/server.yaml`:
 |---|---|---|
 | `asr.backend` | `native_vllm`: `vllm.LLM.chat()` on the audio accumulated for the utterance; language auto-detected unless `asr.force_language` | `qwen_asr`: streaming state of the `qwen_asr` package (needs `qwen-asr[vllm]`) |
 | `vad.backend` | `silero`: Silero TorchScript on CPU, 32 ms frames | `webrtc`: WebRTC VAD, 20 ms frames (needs `webrtcvad-wheels`) |
+
+Tasks (`AudioChunk.task`) are switched on in the same file; at least one must be on:
+
+| Key | Default | Effect |
+|---|---|---|
+| `asr.enabled` | `true` | `speech_to_text`. `false`: Qwen3-ASR, VAD and punctuation are not loaded (no GPU needed) and `speech_to_text` ends with `UNIMPLEMENTED`. |
+| `noise_reduction.enabled` | `false` | `noise_reduction` with DPDFNet-2 on CPU, see [Task `noise_reduction`](#task-noise_reduction-dpdfnet-2). Needs `sherpa-onnx==2.0.2` and the model file. `false`: `UNIMPLEMENTED`. |
 
 The rest of this document describes the defaults.
 
@@ -97,7 +105,7 @@ message: the first chunk fixes the stream.
 |---|---|
 | `session_id`, `stream_id` | Mandatory. Must not change within the RPC. |
 | `pcm` | Signed 16-bit little-endian mono. Length must be even. Normally 80 ms (2560 bytes at 16 kHz); other sizes are accepted. |
-| `sample_rate` | `16000` (or `8000`). Must not change. |
+| `sample_rate` | `16000` (or `8000`; `noise_reduction`: `16000` only). Must not change. |
 | `channels` | `1` (unset is accepted). |
 | `rtp_timestamp` | RTP timestamp of the **first sample** of the chunk, on the source clock. The first chunk anchors the timeline. A later value that does not continue from the audio received (a jump) re-anchors the timeline at that chunk and is logged at WARNING (the first 3 jumps of a stream, then every 500th); processing goes on. |
 | `rtp_clock_rate` | Source RTP clock, `8000` for G.711. `0` means "use `sample_rate`" as the proto defines, and is logged at WARNING. Must not change. |
@@ -106,8 +114,8 @@ message: the first chunk fixes the stream.
 | `end_of_stream` | `true`: the audio in this chunk is processed, the open utterance is committed, the stream is closed. Nothing after it is read. Closing the request stream without it has the same effect. |
 | `language` | `vi`, `en`, `auto` or empty. Empty and unknown codes (logged) take `asr.default_language`; `auto` lets the model detect the language. With `asr.force_language: false` (default) the model detects the language anyway, so this is only the value reported until the model names one. Read from the first chunk only. |
 | `language_source` | Used instead of `language` only when `asr.use_language_source: true`. |
-| `task` | `speech_to_text` or empty. The gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`, `noise_reduction`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. Must not change. |
-| `output_audio_format` | Tag 14, ignored by `speech_to_text`. The format the gateway accepts for returned audio: absent/`LEGACY_ENCODED` = G.711 PCMU, `PCM_S16LE` = raw PCM 16 kHz (gateway `media.codec` g722 or l16). For tasks that return audio (`noise_reduction`, see `../docs/DPDFNet2_Task_Routing_Design_VI.md`). |
+| `task` | `speech_to_text` or empty; `noise_reduction` when `noise_reduction.enabled: true`. A task that is off and the gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. The first chunk picks the task; it must not change. |
+| `output_audio_format` | Tag 14, ignored by `speech_to_text`. The format the gateway accepts for returned audio: absent/`LEGACY_ENCODED` = G.711 PCMU, `PCM_S16LE` = raw PCM 16 kHz (gateway `media.codec` g722 or l16). Used by `noise_reduction`, see below. |
 
 Send audio at real-time pace. The engine never slows the sender down; if more
 than `server.ingress_max_ms` of audio is waiting for ASR the RPC ends with
@@ -179,14 +187,62 @@ default timing one PARTIAL of the model becomes at most 4 results, so at
 `asr.chunk_sec: 0.5` a stream sends at most 8 results per second. Use it with
 `asr.chunk_sec: 0.5`; `window_ms` must not be longer than `asr.chunk_sec`.
 
+### Task `noise_reduction` (DPDFNet-2)
+
+With `noise_reduction.enabled: true`, a stream whose first chunk has `task: noise_reduction`
+is denoised by DPDFNet-2 (sherpa-onnx `OnlineSpeechDenoiser`, CPU) and the audio goes back to
+the gateway, which plays it to the other party. Design:
+`../docs/DPDFNet2_Task_Routing_Design_VI.md`.
+
+On top of the request rules above: `sample_rate` must be `16000`, and
+`output_audio_format` (tag 14) fixes the format of the returned audio for the whole
+stream; another value than `LEGACY_ENCODED` / `PCM_S16LE`, or a change, is
+`INVALID_ARGUMENT`. `language` is not used.
+
+| Response field | Value |
+|---|---|
+| `audio_payload` | `noise_reduction.frame_ms` (20) of audio: 640 bytes of PCM16 LE 16 kHz when `output_audio_format` is `PCM_S16LE`, else 160 bytes of G.711 PCMU 8 kHz. The last one before the final may be shorter. |
+| `audio_format`, `audio_sample_rate` | `PCM_S16LE` and `16000`; unset (`LEGACY_ENCODED`) for PCMU |
+| `audio_pt` | `0` (PCMU) |
+| `is_final` | `false`, except one last result with empty `audio_payload`, after `end_of_stream` or the half-close and the model flush. A cancelled stream gets none. |
+| `ts_start` = `ts_end` | `rtp_timestamp` of the latest chunk given to the model (the gateway measures its latency with it); the final carries the one of the `end_of_stream` chunk |
+| `seq` | +1 for every result, the final included |
+| `text`, tags 20-24 | unset |
+
+- Audio comes back for every chunk, silence included: the gateway plays the original
+  audio for the rest of the call when it gets no audio for
+  `noise_reduction.fallback_after_ms` (500 ms) or the stream ends with an error. An
+  80 ms chunk gives 3 results the first time (the model holds back 10 ms), then 4.
+  The model's own delay is 40 ms.
+- Each stream uses one of the `noise_reduction.max_streams` denoisers loaded at start
+  (about 0.3 s and 20 MB each on the lab CPU). With none free the stream ends at once
+  with `RESOURCE_EXHAUSTED`; it is never queued. A cancelled stream gives its
+  denoiser back when its running model call returns; the denoiser is reset for the
+  next stream.
+- The model runs on `noise_reduction.workers` threads shared by all streams; the
+  calls of one stream run one at a time, in order.
+- A model error ends the stream with `UNAVAILABLE`, and that denoiser is replaced by
+  a newly loaded one.
+- One INFO line per stream when it ends: `noise_reduction stream ended ...
+  outcome=final|cancelled|invalid|model_error output=pcm_s16le|pcmu chunks= samples_in=
+  samples_out= samples_sent= clipped= results= first_audio_ms= model_ms_p50=
+  model_ms_p95= model_ms_max= queue_ms_p95= queue_ms_max= chunk_seq_gaps=`.
+  `model_ms` is the model time per chunk, `queue_ms` the wait for a free worker
+  thread: a growing `queue_ms` means too few `workers` for the streams.
+
+Measured on a laptop CPU (sherpa-onnx 2.0.2, one ONNX thread per denoiser): first
+audio 16 ms after the first chunk, 13-21 ms of model time per 80 ms chunk, the same
+output whatever the chunk size. Measure on the target CPU before choosing
+`max_streams` and `workers`.
+
 ### Status codes
 
 | Code | When |
 |---|---|
-| `INVALID_ARGUMENT` | Missing ids, bad `sample_rate`/`channels`, unknown `task`, odd `pcm` length, a session field changed |
-| `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword`, `voice_controller_emoji` or `noise_reduction` |
-| `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB |
-| `UNAVAILABLE` | `asr.max_consecutive_errors` model failures in a row |
+| `INVALID_ARGUMENT` | Missing ids, bad `sample_rate`/`channels`, unknown `task`, odd `pcm` length, a session field changed; `noise_reduction`: unknown `output_audio_format` |
+| `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword` or `voice_controller_emoji`, or a task that is off (`noise_reduction.enabled` / `asr.enabled` false) |
+| `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB; `noise_reduction`: all denoisers in use |
+| `UNAVAILABLE` | `asr.max_consecutive_errors` model failures in a row; `noise_reduction`: the denoiser failed |
 
 What the gateway does with them: `INVALID_ARGUMENT` and `UNIMPLEMENTED` are
 permanent for it, it does not reconnect and closes the session. After
@@ -292,6 +348,9 @@ Step-by-step instructions (Vietnamese): `HUONG_DAN_CAI_DAT.md`.
 - Both checkpoints must include all configs, tokenizer / preprocessor files
   and weight shards. Model `Horizon-Labs/punctuation-restoration-small` is a
   140M multilingual punctuation token classifier that includes Vietnamese.
+- Only with `noise_reduction.enabled: true`: the `sherpa-onnx==2.0.2` package and
+  the DPDFNet-2 16 kHz model `/opt/models/dpdfnet2.onnx` (about 10 MB, CPU). The
+  server never downloads it.
 
 ### Prepare on a machine WITH Internet
 
@@ -305,6 +364,12 @@ curl -fL --retry 3 \
   'https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.jit' \
   -o ./models/silero_vad.jit
 # Download from the official repository only; TorchScript contains executable code.
+# noise_reduction only: DPDFNet-2 16 kHz; check the SHA-256 before use.
+curl -fL --retry 3 \
+  'https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet2.onnx' \
+  -o ./models/dpdfnet2.onnx
+echo 'ce35d6025fc71df0ef10d1540e1b7916837bbfe5f6896deb744508d2cad487a9  models/dpdfnet2.onnx' | sha256sum -c
+python -m pip download -d wheelhouse sherpa-onnx==2.0.2
 
 # Use the SAME OS / Python ABI / CUDA-compatible wheel sources as your server.
 python -m pip download -d wheelhouse -r requirements.txt
@@ -446,6 +511,16 @@ Unit/integration tests use a deterministic fake ASR and local fake punctuation
 model; this tests streaming, VAD transitions, event semantics and word
 preservation, **not** checkpoint WER, punctuation F1 or GPU latency.
 
+`noise_reduction` is tested with a stand-in denoiser that behaves like DPDFNet-2.
+`tests/test_noise_real_model.py` runs the real model instead and is skipped unless
+`sherpa-onnx` is installed and the model file is given:
+
+```bash
+ASR_TEST_DPDFNET2_MODEL=/opt/models/dpdfnet2.onnx python -m pytest tests/test_noise_real_model.py -s
+```
+
+It needs neither torch nor vLLM, and prints the stream's summary log line.
+
 ## Deployment limitations
 
 1. vLLM `LLM.chat()` calls are synchronous and this server runs every model
@@ -461,6 +536,11 @@ preservation, **not** checkpoint WER, punctuation F1 or GPU latency.
 5. Keep `raw_text` and `text` for QA and troubleshooting. Never let a
    generative postprocessor silently change phone numbers, service codes
    or content of an immutable FINAL.
+6. `noise_reduction` has only been run with the real model on a laptop CPU and
+   with test clients, not with the gateway and MF on real calls; its quality on
+   Vietnamese telephone noise is not assessed yet. Choose
+   `noise_reduction.max_streams` and `workers` from a measurement on the target
+   CPU (see the `model_ms` and `queue_ms` of the summary line).
 
 ## Evaluation client
 

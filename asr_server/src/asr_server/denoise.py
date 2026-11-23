@@ -16,6 +16,7 @@ run(samples, sample_rate), flush() and reset(); run() and flush() return an obje
 samples out add up to the samples in.
 """
 import logging
+import os
 import threading
 
 import numpy as np
@@ -29,6 +30,34 @@ SAMPLE_RATE = 16000
 OUTPUT_PCM16 = 'pcm_s16le'     # PCM16 LE mono 16 kHz: 640 bytes per 20 ms
 OUTPUT_PCMU = 'pcmu'           # G.711 mu-law 8 kHz: 160 bytes per 20 ms
 FRAME_MS = (20, 40, 80)        # the gateway wants multiples of 20 ms
+
+
+def dpdfnet2_factory(model_path, num_threads=1):
+    """Factory of DPDFNet-2 denoisers: sherpa_onnx.OnlineSpeechDenoiser on CPU, 16 kHz.
+
+    Checks the model file and the package now, so that a bad setup stops the start before any
+    model loads. Measured with sherpa-onnx 2.0.2 and dpdfnet2.onnx (SHA-256 ce35d602...87a9).
+    """
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f'missing local DPDFNet-2 model (noise_reduction.model): {model_path}')
+    try:
+        import sherpa_onnx
+    except ImportError as exc:              # not installed, or its native library does not load
+        raise ImportError('noise_reduction.enabled needs the sherpa-onnx package '
+                          f'(sherpa-onnx==2.0.2, see requirements.txt); importing it failed: {exc}') from exc
+    config = sherpa_onnx.OnlineSpeechDenoiserConfig(model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+        dpdfnet=sherpa_onnx.OfflineSpeechDenoiserDpdfNetModelConfig(model=model_path),
+        num_threads=num_threads, provider='cpu', debug=False))
+    if not config.validate():
+        raise ValueError(f'sherpa-onnx rejected the DPDFNet-2 configuration for {model_path}')
+
+    def make():
+        denoiser = sherpa_onnx.OnlineSpeechDenoiser(config)
+        if denoiser.sample_rate != SAMPLE_RATE:
+            raise ValueError(f'{model_path} is a {denoiser.sample_rate} Hz model; '
+                             f'noise_reduction needs {SAMPLE_RATE} Hz')
+        return denoiser
+    return make
 
 
 def _to_pcm16(samples):

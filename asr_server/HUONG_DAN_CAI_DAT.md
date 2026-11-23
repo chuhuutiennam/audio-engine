@@ -25,6 +25,7 @@ Trình tự cài lần đầu: chuẩn bị model (mục 3) → up source (mục
 | Python | 3.10 trở lên | Project yêu cầu `>=3.10`. |
 | Gói Python | Các gói trong `requirements.txt`, cùng `torch` (bản CUDA) và `vllm[audio]` từ 0.16.0 | Tài liệu này coi như môi trường đã có sẵn; mục 5 kiểm tra lại. Thiếu gói thì xem Phụ lục A. |
 | Model | `Qwen3-ASR-1.7B`, `punctuation-restoration-small`, `silero_vad.jit` | Đặt trong `APP/model`. Server tự đặt chế độ offline và không tải gì từ mạng. |
+| Khử nhiễu (tùy chọn) | Gói `sherpa-onnx==2.0.2` và file `dpdfnet2.onnx` | Chỉ cần khi bật `noise_reduction.enabled` (mục 7.1). Chạy trên CPU, không cần GPU. |
 | CPU | Silero VAD và punctuation chạy trên CPU | Số đo trên máy thử 2 nhân: VAD khoảng 2% một nhân và 4,4 MiB RAM cho mỗi stream. |
 | Cổng | TCP 50051 (mặc định) | Không mã hóa, không xác thực: chỉ mở cho Gateway. |
 
@@ -85,6 +86,16 @@ PY
 ```
 
 File TorchScript chứa mã thực thi: chỉ lấy từ nguồn chính thức của Silero.
+
+Chỉ khi dùng khử nhiễu (`noise_reduction`): tải model DPDFNet-2 16 kHz (khoảng 10 MB), kiểm tra SHA-256, và tải wheel `sherpa-onnx` cùng hệ điều hành và phiên bản Python với server:
+
+```bash
+curl -fL --retry 3 \
+  'https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet2.onnx' \
+  -o model/dpdfnet2.onnx
+echo 'ce35d6025fc71df0ef10d1540e1b7916837bbfe5f6896deb744508d2cad487a9  model/dpdfnet2.onnx' | sha256sum -c
+python -m pip download -d wheelhouse sherpa-onnx==2.0.2
+```
 
 Chép thư mục `model/` lên server ở bước 6.2.
 
@@ -159,7 +170,8 @@ copy the missing models, then start with: /u01/ims/audio-engine/bin/start.sh
 /u01/ims/audio-engine/model/
 ├── Qwen3-ASR-1.7B/                    (thư mục)
 ├── punctuation-restoration-small/     (thư mục)
-└── silero_vad.jit                     (file)
+├── silero_vad.jit                     (file)
+└── dpdfnet2.onnx                      (file, chỉ khi bật noise_reduction)
 ```
 
 ### 6.3. Thiết lập riêng của máy
@@ -213,6 +225,8 @@ Các khóa cần xem khi cài:
 | `word_reveal.enabled` | `false` | Đặt `true` để chữ của PARTIAL hiện dần từng từ. |
 | `word_reveal.window_ms` | `400` | Thời gian tối đa để hiện hết các từ mới. Không được lớn hơn `asr.chunk_sec`. |
 | `word_reveal.min_interval_ms` | `120` | Khoảng cách tối thiểu giữa hai kết quả gửi đi trên một stream. |
+| `asr.enabled` | `true` | Đặt `false` khi server chỉ làm khử nhiễu: không nạp Qwen3-ASR, VAD, punctuation (không cần GPU); `speech_to_text` trả `UNIMPLEMENTED`. Phải bật ít nhất một trong `asr.enabled`, `noise_reduction.enabled`. |
+| `noise_reduction.*` | `enabled: false` | Khử nhiễu DPDFNet-2, xem mục 7.1. |
 
 Các khóa còn lại (VAD, punctuation, semantic) có chú thích ngay trong file; giữ mặc định cho lần chạy đầu.
 
@@ -225,6 +239,38 @@ Bật ép ngôn ngữ: **sau khi** nâng cấp xong (code cũ từ chối khóa 
 3. Các stream rtpgw gửi `vi` không còn dòng `model reported language`. Với `asr.log_results: true`, `model_output` không còn bắt đầu bằng `language ...<asr_text>`.
 
 Muốn tắt, đặt lại `force_language: false` và khởi động lại.
+
+### 7.1. Bật khử nhiễu (`noise_reduction`, DPDFNet-2)
+
+Gateway gửi stream có `task=noise_reduction` khi DCSF chọn dịch vụ này. Server lọc nhiễu từng chunk rồi trả audio về cho Gateway phát tiếp; Gateway tự phát audio gốc khi server tắt dịch vụ, lỗi, hoặc không trả audio quá 500 ms. Thiết kế: `docs/DPDFNet2_Task_Routing_Design_VI.md` ở gốc repo.
+
+| Khóa | Mặc định | Ý nghĩa |
+|---|---|---|
+| `noise_reduction.enabled` | `false` | `true`: phục vụ `noise_reduction`. Cần gói `sherpa-onnx` và file model. |
+| `noise_reduction.model` | `/u01/ims/audio-engine/model/dpdfnet2.onnx` (máy cài mới) | File model trên đĩa; server không tự tải. |
+| `noise_reduction.frame_ms` | `20` | Lượng audio mỗi kết quả trả về: `20`, `40` hoặc `80`. |
+| `noise_reduction.num_threads` | `1` | Số luồng ONNX của mỗi bộ lọc. |
+| `noise_reduction.workers` | `2` | Số luồng chạy model, dùng chung cho mọi stream. |
+| `noise_reduction.max_streams` | `16` | Số bộ lọc nạp sẵn lúc khởi động (mỗi bộ khoảng 20 MB RAM, 0,3 s). Stream thứ `max_streams + 1` bị từ chối ngay (`RESOURCE_EXHAUSTED`) và Gateway phát audio gốc. Không được lớn hơn `server.max_streams`. Chọn theo số đo trên CPU thật, không theo số cuộc gọi. |
+
+Các bước:
+
+1. Cài gói trên server: `python3 -m pip install --no-index --find-links=/duong/dan/wheelhouse sherpa-onnx==2.0.2`, rồi kiểm tra `python3 -c "import sherpa_onnx; print(sherpa_onnx.__version__, hasattr(sherpa_onnx, 'OnlineSpeechDenoiser'))"` in `2.0.2 True`.
+2. Chép `dpdfnet2.onnx` vào `/u01/ims/audio-engine/model/` và kiểm tra SHA-256 như ở mục 3.
+3. **Sau khi** nâng cấp lên bản có khử nhiễu (code cũ từ chối khóa lạ): máy cài mới đã có sẵn mục `noise_reduction` trong `config/server.yaml`; máy đã cài từ trước thì chép nguyên mục `noise_reduction` từ `config/server.yaml.dist` (đường dẫn model ở đó đã trỏ vào `APP/model`). Đặt `enabled: true`.
+4. Chạy `--check-config`, rồi `bin/stop.sh` và `bin/start.sh`.
+5. Kiểm tra trong `logs/asr-server.log`: lúc khởi động có dòng `noise_reduction on: 16 denoisers loaded in ... s`; sau mỗi cuộc gọi có dòng `noise_reduction stream ended ... outcome=final` (mục 12.1).
+
+Muốn tắt, đặt lại `enabled: false` và khởi động lại: Gateway nhận `UNIMPLEMENTED` và phát audio gốc.
+
+Kiểm tra trên máy cài, không cần Gateway (cần `pytest`; không cần GPU):
+
+```bash
+cd /u01/ims/namcht/audio-engine/asr_server
+ASR_TEST_DPDFNET2_MODEL=/u01/ims/audio-engine/model/dpdfnet2.onnx python3 -m pytest tests/test_noise_real_model.py -s
+```
+
+Kết quả `5 passed` và một dòng `noise_reduction stream ended ...` có `first_audio_ms`, `model_ms_p95`: số đo trên CPU của máy đó.
 
 Log cấu hình ở `config/logging.yaml`: file `logs/asr-server.log`, xoay vòng lúc nửa đêm, giữ 14 ngày. Muốn thấy các dòng `discard` và `empty final text`, đổi `root.level` thành `DEBUG`.
 
@@ -442,6 +488,10 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 | `rtp_timestamp jump ... chunk_seq=...: expected ..., got ...` | WARNING | `rtp_timestamp` của chunk không nối tiếp audio đã nhận; từ chunk đó `ts_start`/`ts_end` tính theo giá trị mới. Ghi 3 lần đầu của mỗi stream, sau đó mỗi 500 lần. |
 | `model reported language ...` | WARNING | Model báo ngôn ngữ ngoài `vi`/`en`; `language` để rỗng. Chỉ xảy ra khi model tự đoán: `asr.force_language: false`, hoặc stream `auto`. |
 | `punctuation not ready after ... ms; using raw text` | WARNING | Punctuation quá hạn; kết quả dùng text chưa có dấu câu. |
+| `noise_reduction on: N denoisers loaded in ... s, ... worker threads, ... ms of audio per result` | INFO | Lúc khởi động, khi bật khử nhiễu. |
+| `noise_reduction stream ended session=... stream=... outcome=... output=... chunks=... samples_in=... samples_out=... samples_sent=... clipped=... results=... first_audio_ms=... model_ms_p50=... model_ms_p95=... model_ms_max=... queue_ms_p95=... queue_ms_max=... chunk_seq_gaps=...` | INFO | Một stream khử nhiễu kết thúc. `outcome`: `final` (bình thường), `cancelled` (Gateway hủy, ví dụ khi chuyển sang audio gốc), `invalid`, `model_error`. `first_audio_ms` phải dưới 500. `model_ms`: thời gian model cho mỗi chunk 80 ms, phải nhỏ hơn 80 nhiều; `queue_ms` tăng là thiếu `workers`. `clipped` khác 0 là audio ra bị bão hòa. |
+| `noise_reduction refused session=... stream=...: all N denoisers in use (M streams refused since start)` | WARNING | Hết bộ lọc; stream bị từ chối, Gateway phát audio gốc. Ghi 3 lần đầu, sau đó mỗi 100 lần. Tăng `noise_reduction.max_streams` nếu CPU còn dư. |
+| `noise_reduction model failed ...` / `denoiser reset failed ...` | ERROR | Model lỗi; stream đó kết thúc (`UNAVAILABLE`), bộ lọc được nạp lại. |
 | `asr_result call=... leg=... utterance=... revision=... event=... language=... han_chars=N model_output=... raw=... text=...` | INFO | Chỉ có khi `asr.log_results: true`. Mỗi PARTIAL và COMMIT server tạo ra một dòng, ghi trước bước hiện từng từ. Câu trả lời của model không đổi text thì không tạo kết quả nên không có dòng này. |
 
 Các trường của dòng `asr_result`:

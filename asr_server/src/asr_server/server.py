@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import inspect
 import logging
 import os
+import time
 
 import grpc
 import numpy as np
@@ -594,12 +595,8 @@ class ASRService:
                 get_task.cancel()
 
 
-async def serve(args):
-    """Load models and serve until terminated. `args` is asr_server.config.Settings."""
-    os.environ['HF_HUB_OFFLINE'] = '1'
-    os.environ['TRANSFORMERS_OFFLINE'] = '1'
-    os.environ['HF_DATASETS_OFFLINE'] = '1'
-    os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+def _build_asr(args):
+    """asr.enabled: check and load Qwen3-ASR, VAD and punctuation; returns the speech_to_text core."""
     if not os.path.isdir(args.model):
         raise FileNotFoundError(f'missing local ASR checkpoint: {args.model}')
     if not os.path.isdir(args.punct_model):
@@ -646,7 +643,7 @@ async def serve(args):
                               threshold=args.punct_threshold)
     if args.asr_log_results:
         LOG.warning('asr.log_results is on: the text of every call is written to the log')
-    from .speech_service import AUTO_CODE, LANGUAGE_NAMES, SpeechStreamService
+    from .speech_service import AUTO_CODE, LANGUAGE_NAMES
     default_language = (pb.AUTO_LANGUAGE if args.default_language == AUTO_CODE
                         else LANGUAGE_NAMES[args.default_language])
     service = ASRService(
@@ -669,24 +666,67 @@ async def serve(args):
         punct_commit_timeout_ms=args.punct_commit_timeout_ms,
         log_results=args.asr_log_results,
         default_language=default_language)
-    server = grpc.aio.server(
-        maximum_concurrent_rpcs=args.max_streams,
-        options=[('grpc.max_receive_message_length', 2 * 1024 * 1024),
-                 ('grpc.keepalive_time_ms', 30000),
-                 ('grpc.keepalive_timeout_ms', 10000)])
-    from .proto import speech_pb2_grpc
-    speech_pb2_grpc.add_SpeechStreamServicer_to_server(
-        SpeechStreamService(service, use_language_source=args.use_language_source,
-                            word_reveal=args.word_reveal), server)
     if args.word_reveal:
         LOG.info('word-by-word reveal on: window=%d ms, min_interval=%d ms', *args.word_reveal)
-    addr = f'{args.host}:{args.port}'
-    if server.add_insecure_port(addr) == 0:
-        raise RuntimeError(f'failed to bind {addr}')
-    await server.start()
-    LOG.info('listening on %s; plaintext for lab only', addr)
+    return service
+
+
+def _build_noise(args):
+    """noise_reduction.enabled: load every DPDFNet-2 denoiser; returns the noise_reduction service."""
+    from . import denoise
+    from .noise_service import NoiseReductionService
+    LOG.info('loading %d DPDFNet-2 denoisers (%d ONNX threads each) from %s',
+             args.noise_max_streams, args.noise_num_threads, args.noise_model)
+    started = time.monotonic()
     try:
-        await server.wait_for_termination()
+        pool = denoise.DenoiserPool(denoise.dpdfnet2_factory(args.noise_model, args.noise_num_threads),
+                                    args.noise_max_streams)
+    except Exception as exc:
+        # In the log file too: bin/start.sh sends the traceback to logs/asr-server.out only.
+        LOG.error('noise_reduction cannot start: %s: %s', type(exc).__name__, exc)
+        raise
+    LOG.info('noise_reduction on: %d denoisers loaded in %.1f s, %d worker threads, %d ms of audio '
+             'per result', pool.size, time.monotonic() - started, args.noise_workers, args.noise_frame_ms)
+    return NoiseReductionService(pool, frame_ms=args.noise_frame_ms, workers=args.noise_workers)
+
+
+async def serve(args):
+    """Load models and serve until terminated. `args` is asr_server.config.Settings."""
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    os.environ['HF_DATASETS_OFFLINE'] = '1'
+    os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+    # The denoisers first: CPU only, and a missing model stops the start before ASR takes GPU memory.
+    noise = _build_noise(args) if args.noise_enabled else None
+    service = None
+    try:
+        if args.asr_enabled:
+            service = _build_asr(args)
+        else:
+            LOG.info('asr.enabled is false: speech_to_text is off, no ASR, VAD or punctuation model loaded')
+        server = grpc.aio.server(
+            maximum_concurrent_rpcs=args.max_streams,
+            options=[('grpc.max_receive_message_length', 2 * 1024 * 1024),
+                     ('grpc.keepalive_time_ms', 30000),
+                     ('grpc.keepalive_timeout_ms', 10000)])
+        from .proto import speech_pb2_grpc
+        from .speech_service import SpeechStreamService
+        speech_pb2_grpc.add_SpeechStreamServicer_to_server(
+            SpeechStreamService(service, use_language_source=args.use_language_source,
+                                word_reveal=args.word_reveal, noise=noise), server)
+        addr = f'{args.host}:{args.port}'
+        if server.add_insecure_port(addr) == 0:
+            raise RuntimeError(f'failed to bind {addr}')
+        await server.start()
+        LOG.info('listening on %s; plaintext for lab only', addr)
+        try:
+            await server.wait_for_termination()
+        finally:
+            await server.stop(grace=5)
     finally:
-        await server.stop(grace=5)
-        service.close()
+        try:
+            if service is not None:
+                service.close()
+        finally:
+            if noise is not None:
+                noise.close()           # after server.stop(): no RPC uses it any more
