@@ -15,6 +15,8 @@ cd "$ROOT"
 # that far less likely; it was never seen within one file. tests/test_run_tests_script.py keeps
 # this list complete.
 GRPC_SERVER_TESTS="tests/test_force_language.py tests/test_noise_grpc.py tests/test_regression.py tests/test_result_log.py tests/test_serve_noise.py tests/test_speech_grpc.py tests/test_word_pacer.py"
+# The same for tools/eval/tests (paths relative to tools/eval).
+EVAL_GRPC_SERVER_TESTS="tests/test_dual_wer.py tests/test_eval_wav_grpc.py tests/test_vram_and_clean.py"
 
 status=0
 ran=0
@@ -34,8 +36,16 @@ for name in $GRPC_SERVER_TESTS; do
   echo "== server tests: $name =="
   rc=0; "$PYTHON" -m pytest "$name" -q "$@" || rc=$?; note "$rc"
 done
+eval_ignore=()
+for name in $EVAL_GRPC_SERVER_TESTS; do
+  eval_ignore+=("--ignore=$name")
+done
 echo "== eval client tests =="
-rc=0; (cd "$ROOT/tools/eval" && "$PYTHON" -m pytest tests -q "$@") || rc=$?; note "$rc"
+rc=0; (cd "$ROOT/tools/eval" && "$PYTHON" -m pytest tests -q "${eval_ignore[@]}" "$@") || rc=$?; note "$rc"
+for name in $EVAL_GRPC_SERVER_TESTS; do
+  echo "== eval client tests: $name =="
+  rc=0; (cd "$ROOT/tools/eval" && "$PYTHON" -m pytest "$name" -q "$@") || rc=$?; note "$rc"
+done
 
 if [ "$ran" -eq 0 ]; then
   exit 5

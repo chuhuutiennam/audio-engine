@@ -271,6 +271,19 @@ def test_restart_starts_the_fixed_version_after_a_failed_update(source, home):  
     assert health(home) == ['health=ok']
 
 
+def test_restart_of_a_running_server_without_its_models_changes_nothing(source, home):  # noqa: F811
+    # review: the running server was stopped, replaced and started again without its models
+    assert install(source, home, 'v1').returncode == 0
+    assert running_version(home) == 'v1'
+    shutil.rmtree(home / 'model' / 'Qwen3-ASR-1.7B')
+    result = install(source, home, 'v2')
+    assert result.returncode == 1
+    assert 'MISSING  ASR model directory' in result.stdout
+    assert 'the application was not updated' in result.stderr
+    assert running_version(home) == 'v1' and "'v1'" in installed_code(home)
+    assert saved(home) == []
+
+
 def test_restart_does_not_start_without_the_models(source, home):  # noqa: F811
     shutil.rmtree(home / 'model')
     result = install(source, home, 'v1')

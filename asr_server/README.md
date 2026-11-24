@@ -338,9 +338,11 @@ bash scripts/build.sh --test        # run the tests, then build into build/app
 - On the first install the model paths of `config/server.yaml` are set to
   `<app home>/model/...`. Missing model files of the tasks that are on are
   reported (`asr.enabled`: ASR, punctuation, Silero; `noise_reduction.enabled`:
-  `dpdfnet2.onnx` and the `sherpa-onnx` package). `--restart` then does not start
-  a server that was stopped, but a server that was running is started again
-  (and fails to start without its models).
+  `dpdfnet2.onnx` and the `sherpa-onnx` package), before anything is changed;
+  relative model paths count from the run directory, where the server runs. A
+  server that was stopped is then installed but not started by `--restart`; a
+  running server is left alone and the update is refused (copy the models, then
+  update again).
 - An update validates the configuration found in the run directory against the
   new code and the installed code first. If it is not valid, or the server is
   running and `--restart` was not given, nothing is changed. Add the keys of a

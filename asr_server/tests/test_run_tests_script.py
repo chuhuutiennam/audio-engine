@@ -15,16 +15,26 @@ STARTS_A_SERVER = re.compile(r'grpc\.aio\.server\(|insecure_channel\(|\bserver\.
                              r'\bwith_server\(|\bwith_noise_server\(|\bwith_running_server\(')
 
 
-def isolated_files():
+def isolated_files(variable):
     text = (ROOT / 'scripts' / 'run_tests.sh').read_text(encoding='utf-8')
-    match = re.search(r'^GRPC_SERVER_TESTS="([^"]*)"', text, re.M)
-    assert match, 'GRPC_SERVER_TESTS not found in scripts/run_tests.sh'
+    match = re.search(rf'^{variable}="([^"]*)"', text, re.M)
+    assert match, f'{variable} not found in scripts/run_tests.sh'
     return set(match.group(1).split())
 
 
+def starting_a_server(directory):
+    return {f'tests/{path.name}' for path in (directory / 'tests').glob('test_*.py')
+            if path.name != Path(__file__).name
+            and STARTS_A_SERVER.search(path.read_text(encoding='utf-8'))}
+
+
 def test_every_file_that_starts_a_grpc_server_runs_in_its_own_process():
-    starting = {f'tests/{path.name}' for path in (ROOT / 'tests').glob('test_*.py')
-                if path.name != Path(__file__).name
-                and STARTS_A_SERVER.search(path.read_text(encoding='utf-8'))}
-    assert starting == isolated_files()
-    assert all((ROOT / name).is_file() for name in isolated_files())
+    assert starting_a_server(ROOT) == isolated_files('GRPC_SERVER_TESTS')
+    assert all((ROOT / name).is_file() for name in isolated_files('GRPC_SERVER_TESTS'))
+
+
+def test_the_eval_client_tests_that_start_a_grpc_server_run_in_their_own_process():
+    # review: tools/eval/tests start real gRPC servers too, all in one process
+    eval_root = ROOT / 'tools' / 'eval'
+    assert starting_a_server(eval_root) == isolated_files('EVAL_GRPC_SERVER_TESTS')
+    assert all((eval_root / name).is_file() for name in isolated_files('EVAL_GRPC_SERVER_TESTS'))

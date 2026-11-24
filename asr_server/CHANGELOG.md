@@ -46,8 +46,11 @@
   `asr.enabled: false` it no longer asks for the ASR, punctuation and Silero models (a
   noise-only server is started by `--restart`); with `noise_reduction.enabled: true` it reports
   a missing `dpdfnet2.onnx` and a missing or too old `sherpa-onnx`, with the import error.
-- `scripts/run_tests.sh` runs each test file that starts a real gRPC server in its own
-  interpreter (a full run in one process sometimes hung on Windows), goes on after a failure
+  The check runs before anything is changed: a running server whose models are missing is no
+  longer stopped and restarted into a failure, the update is refused instead. Relative model
+  paths are checked from the run directory, and a path with a quote is no longer skipped.
+- `scripts/run_tests.sh` runs each test file that starts a real gRPC server (server and
+  `tools/eval` tests) in its own interpreter (a full run in one process sometimes hung on Windows), goes on after a failure
   and accepts pytest options such as `-k`.
 - `scripts/update.sh` stops when the installed code cannot read the configuration, because that
   version could not be rolled back to. Add the keys of a new version after the update, or pass

@@ -121,6 +121,48 @@ if ! settings="$(PYTHONPATH="$STAGE/lib${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m
   exit 1
 fi
 
+# Model files named by the configuration, for the tasks that are on (asr.enabled,
+# noise_reduction.enabled): reported before anything is changed. The server refuses to start
+# without them, so a running server is left alone when one is missing.
+setting() {   # one value printed by --check-config (a Python repr, so read it with ast)
+  printf '%s\n' "$settings" | "$PYTHON" -c 'import ast, sys
+for line in sys.stdin:
+    key, sep, value = line.rstrip("\r\n").partition(" = ")
+    if sep and key == sys.argv[1]:
+        sys.stdout.buffer.write((str(ast.literal_eval(value)) + "\n").encode("utf-8"))' "$1"
+}
+in_run_dir() {   # bin/start.sh runs the server in the run directory: relative paths start there
+  case "$1" in /*|'') printf '%s' "$1" ;; *) printf '%s/%s' "$APP_HOME" "$1" ;; esac
+}
+missing=0
+if [ "$(setting asr_enabled)" != False ]; then
+  asr_model="$(in_run_dir "$(setting model)")"
+  punct_model="$(in_run_dir "$(setting punct_model)")"
+  if [ -n "$asr_model" ] && [ ! -d "$asr_model" ]; then echo "MISSING  ASR model directory: $asr_model"; missing=1; fi
+  if [ -n "$punct_model" ] && [ ! -d "$punct_model" ]; then echo "MISSING  punctuation model directory: $punct_model"; missing=1; fi
+  if [ "$(setting vad_backend)" = silero ]; then
+    silero_model="$(in_run_dir "$(setting silero_model)")"
+    if [ -n "$silero_model" ] && [ ! -f "$silero_model" ]; then echo "MISSING  Silero VAD file: $silero_model"; missing=1; fi
+  fi
+fi
+if [ "$(setting noise_enabled)" = True ]; then
+  noise_model="$(in_run_dir "$(setting noise_model)")"
+  if [ -n "$noise_model" ] && [ ! -f "$noise_model" ]; then echo "MISSING  DPDFNet-2 model file: $noise_model"; missing=1; fi
+  # The denoiser classes came with sherpa-onnx 2.x (2.0.2 tested); an import error is shown as is.
+  if ! sherpa_error="$("$PYTHON" -c 'import sherpa_onnx as s
+assert hasattr(s, "OnlineSpeechDenoiser") and hasattr(s, "OfflineSpeechDenoiserDpdfNetModelConfig"), \
+    "sherpa-onnx %s has no OnlineSpeechDenoiser" % getattr(s, "__version__", "?")' 2>&1)"; then
+    echo "MISSING  Python package sherpa-onnx==2.0.2 (noise_reduction.enabled; see requirements.txt):" \
+         "$(printf '%s\n' "$sherpa_error" | tail -n 1)"
+    missing=1
+  fi
+fi
+if [ "$was_running" = 1 ] && [ "$missing" = 1 ]; then
+  echo "asr_server is running in $APP_HOME and the models above are missing; the application was not updated" >&2
+  echo "copy the missing models, then run the update again" >&2
+  exit 1
+fi
+
 # The saved version is only useful if its code can read the configuration saved with it.
 old_config_valid=1
 if [ -d "$APP_HOME/lib/asr_server" ]; then
@@ -181,34 +223,6 @@ fi
 } > "$APP_HOME/VERSION"
 version="$(sed -n 's/^version=//p' "$APP_HOME/VERSION")"
 echo "asr_server $version installed in $APP_HOME"
-
-# Model files named by the configuration: report what is missing (the server refuses to start without them).
-# Only for the tasks that are on (asr.enabled, noise_reduction.enabled).
-setting() { printf '%s\n' "$settings" | sed -n "s/^$1 = '\(.*\)'\$/\1/p"; }
-flag() { printf '%s\n' "$settings" | sed -n "s/^$1 = //p"; }      # True | False
-missing=0
-if [ "$(flag asr_enabled)" != False ]; then
-  asr_model="$(setting model)"
-  punct_model="$(setting punct_model)"
-  if [ -n "$asr_model" ] && [ ! -d "$asr_model" ]; then echo "MISSING  ASR model directory: $asr_model"; missing=1; fi
-  if [ -n "$punct_model" ] && [ ! -d "$punct_model" ]; then echo "MISSING  punctuation model directory: $punct_model"; missing=1; fi
-  if [ "$(setting vad_backend)" = silero ]; then
-    silero_model="$(setting silero_model)"
-    if [ -n "$silero_model" ] && [ ! -f "$silero_model" ]; then echo "MISSING  Silero VAD file: $silero_model"; missing=1; fi
-  fi
-fi
-if [ "$(flag noise_enabled)" = True ]; then
-  noise_model="$(setting noise_model)"
-  if [ -n "$noise_model" ] && [ ! -f "$noise_model" ]; then echo "MISSING  DPDFNet-2 model file: $noise_model"; missing=1; fi
-  # The denoiser classes came with sherpa-onnx 2.x (2.0.2 tested); an import error is shown as is.
-  if ! sherpa_error="$("$PYTHON" -c 'import sherpa_onnx as s
-assert hasattr(s, "OnlineSpeechDenoiser") and hasattr(s, "OfflineSpeechDenoiserDpdfNetModelConfig"), \
-    "sherpa-onnx %s has no OnlineSpeechDenoiser" % getattr(s, "__version__", "?")' 2>&1)"; then
-    echo "MISSING  Python package sherpa-onnx==2.0.2 (noise_reduction.enabled; see requirements.txt):" \
-         "$(printf '%s\n' "$sherpa_error" | tail -n 1)"
-    missing=1
-  fi
-fi
 
 if [ "$was_running" = 1 ] || { [ "$restart" = 1 ] && [ "$missing" = 0 ]; }; then
   bash "$APP_HOME/bin/start.sh" || true    # bin/wait_ready.sh reports a server that did not start

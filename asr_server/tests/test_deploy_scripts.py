@@ -127,6 +127,40 @@ def test_missing_noise_model_is_reported(source, tmp_path):
     assert 'copy the missing models' in result.stdout
 
 
+def _set_model_paths(home, asr, punct):
+    config = home / 'config' / 'server.yaml'
+    text = config.read_text()
+    text = text.replace(f'model: {home}/model/Qwen3-ASR-1.7B', f'model: {asr}')
+    text = text.replace(f'model: {home}/model/punctuation-restoration-small', f'model: {punct}')
+    config.write_text(text)
+
+
+def test_relative_model_paths_are_checked_from_the_run_directory(source, tmp_path):
+    # review: they were checked from the directory update.sh was started in; the server runs in
+    # the run directory (bin/start.sh)
+    home = tmp_path / 'app'
+    assert update(source, home).returncode == 0
+    (home / 'model' / 'Qwen3-ASR-1.7B').mkdir()
+    (home / 'model' / 'silero_vad.jit').write_bytes(b'x')
+    _set_model_paths(home, 'model/Qwen3-ASR-1.7B', 'model/punct-missing')
+    result = update(source, home, '--no-build')
+    assert result.returncode == 0, result.stderr
+    assert 'ASR model' not in result.stdout
+    assert f'MISSING  punctuation model directory: {home}/model/punct-missing' in result.stdout
+
+
+def test_a_model_path_with_a_quote_is_checked(source, tmp_path):
+    # review: --check-config prints such a path in double quotes, which the parser skipped
+    home = tmp_path / 'app'
+    assert update(source, home).returncode == 0
+    (home / 'model' / 'Qwen3-ASR-1.7B').mkdir()
+    (home / 'model' / 'silero_vad.jit').write_bytes(b'x')
+    _set_model_paths(home, f'{home}/model/Qwen3-ASR-1.7B', f'"{home}/model/o\'brien"')
+    result = update(source, home, '--no-build')
+    assert result.returncode == 0, result.stderr
+    assert f"MISSING  punctuation model directory: {home}/model/o'brien" in result.stdout
+
+
 def test_no_missing_report_when_the_models_are_present(source, tmp_path):
     home = tmp_path / 'app'
     (home / 'model' / 'Qwen3-ASR-1.7B').mkdir(parents=True)
