@@ -122,7 +122,7 @@ if ! settings="$(PYTHONPATH="$STAGE/lib${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m
 fi
 
 # Model files named by the configuration, for the tasks that are on (asr.enabled,
-# noise_reduction.enabled): reported before anything is changed. The server refuses to start
+# noise_reduction.enabled, asr_denoise.enabled): reported before anything is changed. The server refuses to start
 # without them, so a running server is left alone when one is missing.
 setting() {   # one value printed by --check-config (a Python repr, so read it with ast)
   printf '%s\n' "$settings" | "$PYTHON" -c 'import ast, sys
@@ -145,14 +145,26 @@ if [ "$(setting asr_enabled)" != False ]; then
     if [ -n "$silero_model" ] && [ ! -f "$silero_model" ]; then echo "MISSING  Silero VAD file: $silero_model"; missing=1; fi
   fi
 fi
+# DPDFNet-2 (sherpa-onnx): noise_reduction and asr_denoise (in front of speech_to_text).
+dpdfnet2_users=""
 if [ "$(setting noise_enabled)" = True ]; then
+  dpdfnet2_users="noise_reduction"
   noise_model="$(in_run_dir "$(setting noise_model)")"
   if [ -n "$noise_model" ] && [ ! -f "$noise_model" ]; then echo "MISSING  DPDFNet-2 model file: $noise_model"; missing=1; fi
+fi
+if [ "$(setting stt_denoise_enabled)" = True ]; then
+  dpdfnet2_users="${dpdfnet2_users:+$dpdfnet2_users.enabled and }asr_denoise"
+  stt_denoise_model="$(in_run_dir "$(setting stt_denoise_model)")"
+  if [ -n "$stt_denoise_model" ] && [ ! -f "$stt_denoise_model" ]; then
+    echo "MISSING  DPDFNet-2 model file (asr_denoise.model): $stt_denoise_model"; missing=1
+  fi
+fi
+if [ -n "$dpdfnet2_users" ]; then
   # The denoiser classes came with sherpa-onnx 2.x (2.0.2 tested); an import error is shown as is.
   if ! sherpa_error="$("$PYTHON" -c 'import sherpa_onnx as s
 assert hasattr(s, "OnlineSpeechDenoiser") and hasattr(s, "OfflineSpeechDenoiserDpdfNetModelConfig"), \
     "sherpa-onnx %s has no OnlineSpeechDenoiser" % getattr(s, "__version__", "?")' 2>&1)"; then
-    echo "MISSING  Python package sherpa-onnx==2.0.2 (noise_reduction.enabled; see requirements.txt):" \
+    echo "MISSING  Python package sherpa-onnx==2.0.2 ($dpdfnet2_users.enabled; see requirements.txt):" \
          "$(printf '%s\n' "$sherpa_error" | tail -n 1)"
     missing=1
   fi

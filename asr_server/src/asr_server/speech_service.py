@@ -291,7 +291,11 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
                     return
 
         stream_requests = requests()
-        if self.stt_denoise is not None and first is not None and self.stt_denoise.applies(first):
+        # Only a first chunk that can pass _open() is considered: a stream about to be refused
+        # must not borrow a denoiser or count in the stats.
+        if (self.stt_denoise is not None and first is not None and first.session_id and first.stream_id
+                and first.task in SUPPORTED_TASKS and first.sample_rate in (8000, 16000)
+                and self.stt_denoise.applies(first)):
             # The checks above still see every chunk as sent; only the audio the core gets changes.
             stream_requests = self.stt_denoise.stream(stream_requests, first.session_id, first.stream_id)
         transcripts = self.core.StreamRecognize(stream_requests, context)

@@ -21,11 +21,12 @@ from asr_server.speech_service import SpeechStreamService
 from asr_server.stt_denoise import SttDenoiser
 
 from test_denoise_processor import DelayedDenoiser, FailingDenoiser
-from test_regression import Aborted, FakeContext, make_service, pcm
+from test_regression import Aborted, FakeASR, FakeContext, make_service, pcm
 from test_speech_grpc import SILENCE_VOICE_SILENCE, TWO, as_stream, chunks
 
 WIDE = {'output_audio_format': pb.PCM_S16LE}         # what rtpgw sends for G.722 and L16 calls
 SPEECH = TWO + SILENCE_VOICE_SILENCE                   # three utterances and long silences
+ONE_SHORT = [pcm(0.6, True), pcm(0.6, False)]
 
 
 def stage(*denoisers, **options):
@@ -304,3 +305,105 @@ def test_stt_denoiser_is_closed_when_the_server_stops(tmp_path, fake_asr, monkey
         pass
     asyncio.run(with_running_server(stt_settings(tmp_path), check))
     assert len(closed) == 1
+
+
+# ------------------------------------------------------------ review of slice 2
+def test_a_stream_waiting_for_a_busy_worker_is_not_blamed_on_its_model(caplog):
+    """workers=1: stream B's call waits behind stream A's slow call. Both go on with the input
+    (latency is bounded), but B's reason is `busy`, not `model_slow`."""
+    a = SlowAt(slow_run=2, seconds=0.6, gain=1.0)
+    b = DelayedDenoiser(gain=1.0)
+    s = stage(b, a, max_backlog_ms=150, workers=1)   # the pool lends from the end: A gets `a`
+    messages_a = chunks(TWO, **WIDE)
+    messages_b = chunks(TWO, session='call-2', stream='call-2-a2b', **WIDE)
+    expected_a, expected_b = fields(recognise(messages_a)), fields(recognise(messages_b))
+
+    async def run():
+        service = SpeechStreamService(make_service(), stt_denoise=s)
+
+        async def one(messages, delay):
+            await asyncio.sleep(delay)
+            return [r async for r in service.Recognize(paced(messages, 0.02), FakeContext())]
+        return await asyncio.gather(one(messages_a, 0), one(messages_b, 0.1))
+    with caplog.at_level(logging.WARNING, logger='qwen3_asr.stt_denoise'):
+        out_a, out_b = asyncio.run(run())
+    assert fields(out_a) == expected_a and fields(out_b) == expected_b
+    assert (s.stats['fallback_slow'], s.stats['fallback_busy']) == (1, 1)
+    assert any('session=call-2' in r.getMessage() and 'reason=busy' in r.getMessage() for r in caplog.records)
+
+
+def test_no_free_denoiser_warning_is_not_repeated_for_every_stream(caplog):
+    s = stage()
+    taken = s.pool.acquire()
+    with caplog.at_level(logging.WARNING, logger='qwen3_asr.stt_denoise'):
+        for _ in range(6):
+            recognise(chunks(ONE_SHORT, **WIDE), s)
+    warnings = [r for r in caplog.records if 'no denoiser free' in r.getMessage()]
+    assert s.stats['no_denoiser'] == 6 and len(warnings) == 3        # the first 3, then every 500th
+    s.pool.release(taken)
+
+
+def test_a_non_16khz_model_is_refused_naming_asr_denoise(tmp_path, monkeypatch):
+    from test_serve_noise import fake_sherpa
+    model = tmp_path / 'dpdfnet2.onnx'
+    model.write_bytes(b'onnx')
+    monkeypatch.setitem(__import__('sys').modules, 'sherpa_onnx', fake_sherpa(rate=8000))
+    with pytest.raises(ValueError, match=r'asr_denoise needs 16000 Hz'):
+        denoise_module.dpdfnet2_factory(str(model), setting='asr_denoise')()
+
+
+# ------------------------------------------------------------ review of slice 3
+def test_a_stream_that_went_raw_gives_its_denoiser_back_at_once():
+    """After a fallback the denoiser is of no use to the stream: another call must get it."""
+    s = stage(max_backlog_ms=200)                    # all chunks at once: backlog at the first chunk
+    service = SpeechStreamService(make_service(), stt_denoise=s)
+
+    async def run():
+        source = as_stream(chunks(SPEECH, end=False, **WIDE))
+        results = service.Recognize(paced_after_first(source), FakeContext())
+        first = asyncio.ensure_future(anext(results, None))
+        await asyncio.sleep(0.3)                      # stream 1 fell back and is still open
+        free = s.pool.free
+        first.cancel()
+        await results.aclose()
+        return free
+    assert asyncio.run(run()) == 1 and s.stats['fallback_backlog'] == 1
+
+
+async def paced_after_first(source):
+    """All chunks at once, then the stream stays open."""
+    async for message in source:
+        yield message
+    await asyncio.sleep(10)
+
+
+def test_a_stream_rejected_on_its_first_chunk_does_not_borrow_a_denoiser(caplog):
+    s = stage()
+    taken = s.pool.acquire()                          # pool empty: a borrow attempt would warn
+    bad = chunks(SPEECH, task='realtime_translation', **WIDE)
+    with caplog.at_level(logging.WARNING, logger='qwen3_asr.stt_denoise'):
+        with pytest.raises(Aborted):
+            recognise(bad, s)
+    assert s.stats['no_denoiser'] == 0 and s.stats['narrowband'] == 0
+    assert not [r for r in caplog.records if 'no denoiser free' in r.getMessage()]
+    s.pool.release(taken)
+
+
+def test_a_stream_ended_by_a_protocol_error_is_not_logged_as_cancelled(caplog):
+    def change_session(messages):
+        messages[5].session_id = 'other'
+    with caplog.at_level(logging.INFO, logger='qwen3_asr.stt_denoise'):
+        with pytest.raises(Aborted):
+            recognise(chunks(SPEECH, mutate=change_session, **WIDE), stage())
+    line = [r.getMessage() for r in caplog.records if 'stt_denoise stream ended' in r.getMessage()]
+    assert len(line) == 1 and 'outcome=error' in line[0]
+
+
+def test_ingress_overflow_of_the_core_gives_the_denoiser_back():
+    s = stage()
+    with pytest.raises(Aborted) as aborted:
+        # a slow ASR: the audio piles up in the core's queue, past server.ingress_max_ms
+        recognise(chunks(SPEECH, **WIDE), s, core=make_service(FakeASR(text='xin chao anh', delay=0.2),
+                                                               ingress_max_ms=200))
+    assert aborted.value.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert s.pool.free == 1

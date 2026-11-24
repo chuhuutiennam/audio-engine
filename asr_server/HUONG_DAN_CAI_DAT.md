@@ -273,6 +273,33 @@ ASR_TEST_DPDFNET2_MODEL=/u01/ims/audio-engine/model/dpdfnet2.onnx python3 -m pyt
 
 Kết quả `5 passed` và một dòng `noise_reduction stream ended ...` có `first_audio_ms`, `model_ms_p95`: số đo trên CPU của máy đó.
 
+### 7.2. Khử nhiễu trước nhận dạng (`asr_denoise`, DPDFNet-2)
+
+Khi bật, audio của các stream `speech_to_text` đi qua DPDFNet-2 rồi mới vào VAD và ASR. Kết quả trả cho Gateway giữ nguyên dạng: không thêm trường proto, `ts_start`/`ts_end` không lệch. Mặc định tắt.
+
+| Khóa | Mặc định | Ý nghĩa |
+|---|---|---|
+| `asr_denoise.enabled` | `false` | `true`: khử nhiễu trước VAD/ASR. Cần `asr.enabled: true`, gói `sherpa-onnx` và file model. |
+| `asr_denoise.model` | `/u01/ims/audio-engine/model/dpdfnet2.onnx` (máy cài mới) | File model trên đĩa, dùng chung file với `noise_reduction` được. Lúc khởi động server kiểm tra độ trễ của model bằng một xung: khác 640 mẫu (40 ms) thì từ chối khởi động, vì timestamp sẽ lệch. |
+| `asr_denoise.apply_to` | `wideband` | `wideband`: chỉ các cuộc gọi Gateway chạy G.722/L16 (chunk đầu có `output_audio_format: PCM_S16LE`). Cuộc gọi G.711 đi qua nguyên vẹn, vì DPDFNet-2 làm mất tiếng nói trên audio băng hẹp. `all`: mọi stream 16 kHz, chỉ dùng khi đo thử (mục 10.3). |
+| `asr_denoise.num_threads` | `1` | Số luồng ONNX của mỗi bộ lọc. |
+| `asr_denoise.workers` | `2` | Số luồng chạy model, dùng chung cho mọi stream. |
+| `asr_denoise.max_streams` | `16` | Số bộ lọc nạp sẵn lúc khởi động (mỗi bộ khoảng 20 MB RAM). Pool này riêng, không dùng chung với `noise_reduction`. Stream không còn bộ lọc thì được nhận dạng từ audio gốc. Không được lớn hơn `server.max_streams`. |
+| `asr_denoise.max_backlog_ms` | `500` | Khi một lần gọi model, hoặc lượng audio chờ model, vượt mức này, stream chuyển sang audio gốc **từ mẫu kế tiếp** đến hết stream (không mất, không lặp mẫu); bộ lọc được trả ngay cho cuộc gọi khác. Tối đa `5000`. `0` = không giới hạn, chỉ dùng trên server thử khi client gửi nhanh hơn thời gian thực (`--fast`): khi đó một lần gọi model bị kẹt sẽ giữ cả stream. |
+
+Các bước bật:
+
+1. Cài `sherpa-onnx==2.0.2` và chép `dpdfnet2.onnx` như mục 7.1, bước 1–2.
+2. **Sau khi** nâng cấp lên bản có `asr_denoise`: máy đã cài từ trước thì chép nguyên mục `asr_denoise` từ `config/server.yaml.dist` sang `config/server.yaml`, rồi đặt `enabled: true`.
+3. Chạy `--check-config`, rồi `bin/stop.sh` và `bin/start.sh`. Khi model hoặc `sherpa-onnx` còn thiếu, `scripts/update.sh` báo `MISSING  DPDFNet-2 model file (asr_denoise.model): ...` hoặc `MISSING  Python package sherpa-onnx==2.0.2 (asr_denoise.enabled; ...)`.
+4. Kiểm tra `logs/asr-server.log`: lúc khởi động có dòng `asr_denoise on: N denoisers loaded ...`; sau mỗi cuộc gọi G.722/L16 có dòng `stt_denoise stream ended ... outcome=denoised`.
+
+**Trước khi bật ở production**, phải so WER khi tắt và khi bật trên cùng bộ ghi âm băng rộng (mục 10.3). Lý do: trên 6 mẫu VoiceBank, khử nhiễu giảm VAD báo nhầm từ 31% xuống 5%, nhưng ở 2 mẫu VAD bỏ sót nhiều tiếng nói hơn (0,6% lên 8,3%; 5,6% lên 9,3%).
+
+Về CPU, trên laptop 12 luồng, khử nhiễu chạy được khoảng 10 stream đồng thời. Trên server phải đo lại, sau khi đã trừ phần CPU ASR dùng, rồi mới chọn `max_streams` và `workers`.
+
+Muốn tắt, đặt `enabled: false` và khởi động lại: ASR nhận audio gốc như trước.
+
 Log cấu hình ở `config/logging.yaml`: file `logs/asr-server.log`, xoay vòng lúc nửa đêm, giữ 14 ngày. Muốn thấy các dòng `discard` và `empty final text`, đổi `root.level` thành `DEBUG`.
 
 ---
@@ -406,6 +433,24 @@ python3 eval_wav_grpc.py \
 
 Không dùng RTF của lần chạy không có `--fast`: con số đó gồm cả thời gian client chờ theo nhịp thực. Nếu để `asr.partial_max_backlog_ms` khác `0` khi chạy `--fast`, server bỏ hết các lần nhận dạng PARTIAL và RTF chỉ còn tính phần FINAL.
 
+### 10.3. So WER khi tắt và bật `asr_denoise`
+
+Client đo không gửi `output_audio_format`. Vì vậy trên server thử phải đặt `asr_denoise.apply_to: all`, nếu không thì stream của client đo không được khử nhiễu. Dùng bản ghi âm **băng rộng** 16 kHz, đúng loại cuộc gọi G.722/L16 sẽ được khử nhiễu.
+
+```bash
+# 1. Tắt: asr_denoise.enabled: false; khởi động lại; đo
+python3 eval_wav_grpc.py --wav /u01/ims/audio-engine/data/ghi_am.wav \
+  --truth /u01/ims/audio-engine/data/ground_truth.txt --output-dir /u01/ims/audio-engine/data/eval_denoise_off
+
+# 2. Bật: asr_denoise.enabled: true, asr_denoise.apply_to: all; khởi động lại; đo lại cùng file
+python3 eval_wav_grpc.py --wav /u01/ims/audio-engine/data/ghi_am.wav \
+  --truth /u01/ims/audio-engine/data/ground_truth.txt --output-dir /u01/ims/audio-engine/data/eval_denoise_on
+
+# 3. Đặt lại asr_denoise.apply_to: wideband trước khi chạy thật
+```
+
+So `metrics.json` của hai thư mục, dùng WER trước dấu câu. Đọc thêm `stream_events.jsonl` để xem có câu nào mất hẳn, hoặc mất âm đầu/cuối câu (so `ts_start`/`ts_end` của từng FINAL). Trong log bản bật phải có `stt_denoise stream ended ... outcome=denoised`. Chỉ bật ở production khi WER không tăng và không có câu nào bị mất. Nên đo trên nhiều bản ghi có nhiễu thật (đường phố, văn phòng, xe); một file chưa đủ.
+
 ---
 
 ## 11. Cập nhật phiên bản
@@ -494,6 +539,11 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 | `noise_reduction refused session=... stream=...: all N denoisers in use (M streams refused since start)` | WARNING | Hết bộ lọc; stream bị từ chối, Gateway phát audio gốc. Ghi 3 lần đầu, sau đó mỗi 100 lần. Tăng `noise_reduction.max_streams` nếu CPU còn dư. |
 | `noise_reduction backlog session=... stream=...: N ms of audio waiting to be processed, above noise_reduction.max_backlog_ms ...; stream closed (M streams closed since start)` | WARNING | Audio chờ xử lý vượt ngưỡng; stream bị đóng, Gateway phát audio gốc. Ghi 3 lần đầu, sau đó mỗi 100 lần. Nếu `model_ms`, `queue_ms` của dòng tóm tắt cao thì CPU không theo kịp: giảm `max_streams` hoặc tăng `workers` nếu còn nhân CPU. Nếu chúng thấp thì nguyên nhân là Gateway gửi dồn hoặc đọc kết quả chậm. |
 | `noise_reduction model failed ...` / `denoiser reset failed ...` | ERROR | Model lỗi; stream đó kết thúc (`UNAVAILABLE`), bộ lọc được nạp lại. |
+| `asr_denoise on: N denoisers loaded in ... s, ... worker threads, apply_to=..., max_backlog_ms=...` | INFO | Lúc khởi động, khi bật khử nhiễu trước ASR. |
+| `asr_denoise cannot start: ...` | ERROR | Thiếu model, thiếu `sherpa-onnx`, hoặc model có độ trễ khác 640 mẫu (`the denoiser delays audio by N samples`). Server không khởi động. |
+| `stt_denoise stream ended session=... stream=... outcome=... reason=... chunks=... samples_in=... samples_out=... model_ms_p50=... model_ms_p95=... model_ms_max=... backlog_ms_max=...` | INFO | Một stream STT có khử nhiễu kết thúc. `outcome`: `denoised` (khử nhiễu đến hết), `fallback` (đã chuyển sang audio gốc, xem `reason`), `cancelled` (Gateway hủy hoặc mất kết nối), `error` (stream bị từ chối giữa chừng, ví dụ lỗi giao thức). `samples_out` bằng `samples_in` là không mất mẫu. `model_ms`: thời gian model cho mỗi chunk, phải nhỏ hơn độ dài chunk nhiều. |
+| `stt_denoise fallback session=... stream=... reason=... at_sample=N (...)` | WARNING | Từ mẫu N, stream dùng audio gốc đến hết. `reason`: `model_error` (model lỗi, bộ lọc được nạp lại), `model_slow` (một lần gọi quá `max_backlog_ms`), `busy` (mọi luồng `workers` đều bận quá `max_backlog_ms`: thiếu `workers` hoặc CPU), `backlog` (audio chờ quá `max_backlog_ms`). Gặp thường xuyên thì giảm `max_streams` hoặc tăng `workers` nếu còn nhân CPU. |
+| `stt_denoise: no denoiser free (asr_denoise.max_streams=N) ...; the stream is recognised from the audio as sent (M such streams so far)` | WARNING | Hết bộ lọc; stream đó không được khử nhiễu. Ghi 3 lần đầu, sau đó mỗi 500 lần. |
 | `asr_result call=... leg=... utterance=... revision=... event=... language=... han_chars=N model_output=... raw=... text=...` | INFO | Chỉ có khi `asr.log_results: true`. Mỗi PARTIAL và COMMIT server tạo ra một dòng, ghi trước bước hiện từng từ. Câu trả lời của model không đổi text thì không tạo kết quả nên không có dòng này. |
 
 Các trường của dòng `asr_result`:

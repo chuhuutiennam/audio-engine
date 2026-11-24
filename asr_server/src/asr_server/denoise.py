@@ -62,7 +62,7 @@ def dpdfnet2_factory(model_path, num_threads=1, setting='noise_reduction'):
         denoiser = sherpa_onnx.OnlineSpeechDenoiser(config)
         if denoiser.sample_rate != SAMPLE_RATE:
             raise ValueError(f'{model_path} is a {denoiser.sample_rate} Hz model; '
-                             f'noise_reduction needs {SAMPLE_RATE} Hz')
+                             f'{setting} needs {SAMPLE_RATE} Hz')
         return denoiser
     return make
 

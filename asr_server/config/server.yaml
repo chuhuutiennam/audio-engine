@@ -90,6 +90,7 @@ asr_denoise:                 # speech_to_text: DPDFNet-2 (CPU) in front of VAD a
   workers: 2                 # threads that run the denoisers of all streams
   max_streams: 16            # denoisers loaded at start (~20 MB each); a stream that finds none
                              # free is recognised from the audio as sent. Not above server.max_streams
-  max_backlog_ms: 500        # more audio than this waiting for the model (the CPU does not keep up):
-                             # the stream goes on with the audio as sent, from the next sample.
-                             # 0 = no limit, at most 5000
+  max_backlog_ms: 500        # more audio than this waiting for the model (the CPU does not keep up),
+                             # or one model call this long: the stream goes on with the audio as sent,
+                             # from the next sample. At most 5000. 0 = no limit, test servers only
+                             # (tools/eval --fast): a stuck model call would then hold the stream

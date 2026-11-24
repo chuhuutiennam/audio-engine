@@ -4,6 +4,21 @@
 
 ### Added
 
+- `asr_denoise` (default off): DPDFNet-2 in front of VAD and ASR for `speech_to_text`
+  (`stt_denoise.py`). It is applied by default only to calls the gateway carries as G.722 or
+  L16 (`apply_to: wideband`); G.711 calls go through as sent.
+  - The model's 40 ms delay is removed, so VAD/ASR get as many samples as were sent and
+    timestamps do not move. The server refuses a model whose delay is not 640 samples.
+  - One denoiser per stream from a pool of its own (`asr_denoise.max_streams`); its state is
+    kept for the whole stream and it is flushed once, at the end.
+  - Audio is never lost. With no denoiser free, the stream is recognised as sent. On a model
+    error, a call slower than `max_backlog_ms` (or with no free worker thread), or a backlog,
+    the stream goes on with the audio as sent from the next sample.
+  - Log lines `stt_denoise stream ended` and `stt_denoise fallback`.
+  - New keys in `config/server.yaml`: `asr_denoise.enabled`, `model`, `apply_to`,
+    `num_threads`, `workers`, `max_streams`, `max_backlog_ms`.
+  - `scripts/update.sh` reports the model file and `sherpa-onnx` when it is on.
+  - Compare WER with it off and on before production (HUONG_DAN_CAI_DAT section 10.3).
 - Task `noise_reduction`: DPDFNet-2 speech denoising on CPU (sherpa-onnx 2.0.2
   `OnlineSpeechDenoiser`), off by default. The audio goes back in every result as PCM16 16 kHz
   or G.711 PCMU 8 kHz, as `AudioChunk.output_audio_format` (tag 14) asks; one empty `is_final`

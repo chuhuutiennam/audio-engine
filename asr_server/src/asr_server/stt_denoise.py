@@ -11,14 +11,17 @@ G.722 or L16 (first chunk: output_audio_format PCM_S16LE, sample_rate 16000): on
 G.711 audio DPDFNet-2 turned down much of the speech. 'all': every 16 kHz stream. Never 8 kHz.
 
 Audio is never lost. A stream that finds no denoiser free is not denoised. When the model fails,
-one model call takes longer than max_backlog_ms, or more than max_backlog_ms of audio waits for
+one model call takes longer than max_backlog_ms (model_slow; busy when the call has not even
+started because every worker thread is taken), or more than max_backlog_ms of audio waits for
 the model, the stream goes on with the audio as sent from the next sample on: the input the
 model has not given back yet comes first (kept here, not in the processor, which a slow call may
-still be using). One WARNING per fallback, one INFO line per stream, counters in `stats`.
+still be using). The denoiser then goes back to the pool at once (after a running call), for
+other calls. One WARNING per fallback, one INFO line per stream, counters in `stats`.
 """
 import asyncio
 import collections
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,11 +34,18 @@ LOG = logging.getLogger('qwen3_asr.stt_denoise')
 
 BYTES_PER_MS = SAMPLE_RATE * 2 / 1000       # PCM16 mono
 _EOF = object()
-_STATS_KEY = {'model_error': 'fallback_error', 'model_slow': 'fallback_slow', 'backlog': 'fallback_backlog'}
+_STATS_KEY = {'model_error': 'fallback_error', 'model_slow': 'fallback_slow', 'busy': 'fallback_busy',
+              'backlog': 'fallback_backlog'}
+WARN_FIRST, WARN_EVERY = 3, 500     # repeated warnings: the first 3, then every 500th
 
 
 class _Slow(Exception):
-    """A model call took longer than max_backlog_ms; it goes on, its result is dropped."""
+    """A model call took longer than max_backlog_ms; it goes on, its result is dropped.
+    `busy`: it had not started, every worker thread was taken (it is cancelled)."""
+
+    def __init__(self, busy):
+        super().__init__()
+        self.busy = busy
 
 
 class _Run:
@@ -66,28 +76,37 @@ class _Run:
         return m.StreamRequest(audio=m.AudioChunk(data=pcm, sequence=self.seq))
 
     async def call(self, fn, *args):
+        running = threading.Event()
+
         def timed():
+            running.set()
             started = time.perf_counter()
             return fn(*args), time.perf_counter() - started
         self.job = self.owner._executor.submit(timed)     # RuntimeError once closed: a model error
         future = asyncio.wrap_future(self.job)
         limit = self.owner.max_backlog_ms
         if limit:
+            # Bounds the audio's wait, queue included: ASR must not wait for the denoiser.
             done, _ = await asyncio.wait({future}, timeout=limit / 1000)
             if not done:
                 future.add_done_callback(lambda f: f.cancelled() or f.exception())   # nobody waits
-                raise _Slow()
+                busy = not running.is_set()
+                if busy:
+                    self.job.cancel()       # not started: it never will, the denoiser is free now
+                raise _Slow(busy)
         result, seconds = await future
         self.model_ms.add(1000 * seconds)
         return result
 
     def go_raw(self, reason, detail=''):
-        """From the next sample on the stream gets the input as sent; returns the input held back."""
+        """From the next sample on the stream gets the input as sent; returns the input held back.
+        The denoiser is of no use to this stream any more: it goes back to the pool."""
         self.fallback = reason
         self.owner.stats[_STATS_KEY[reason]] += 1
         LOG.warning('stt_denoise fallback session=%s stream=%s reason=%s at_sample=%d%s: the stream '
                     'goes on with the audio as sent', self.session_id, self.stream_id, reason,
                     self.samples_out, f' ({detail})' if detail else '')
+        self.owner._release(self)
         out = bytes(self.raw)
         self.raw.clear()
         return out
@@ -95,7 +114,9 @@ class _Run:
     async def _model(self, fn, *args):
         try:
             return await self.call(fn, *args), None
-        except _Slow:
+        except _Slow as exc:
+            if exc.busy:
+                return None, self.go_raw('busy', f'no worker thread free for {self.owner.max_backlog_ms} ms')
             return None, self.go_raw('model_slow', f'one call over {self.owner.max_backlog_ms} ms')
         except Exception as exc:
             self.broken = True
@@ -157,8 +178,11 @@ class SttDenoiser:
         denoiser = self.pool.acquire()
         if denoiser is None:
             self.stats['no_denoiser'] += 1
-            LOG.warning('stt_denoise: no denoiser free (asr_denoise.max_streams=%d) session=%s stream=%s; '
-                        'the stream is recognised from the audio as sent', self.pool.size, session_id, stream_id)
+            refused = self.stats['no_denoiser']
+            if refused <= WARN_FIRST or refused % WARN_EVERY == 0:
+                LOG.warning('stt_denoise: no denoiser free (asr_denoise.max_streams=%d) session=%s stream=%s; '
+                            'the stream is recognised from the audio as sent (%d such streams so far)',
+                            self.pool.size, session_id, stream_id, refused)
             async for req in requests:
                 yield req
             return
@@ -184,6 +208,7 @@ class SttDenoiser:
             while True:
                 item = await queue.get()
                 if isinstance(item, Exception):
+                    run.outcome = 'error'
                     raise item
                 if item is _EOF or item[0].WhichOneof('payload') == 'end_stream':
                     tail = await run.finish()
@@ -209,9 +234,14 @@ class SttDenoiser:
             self._summary(run)
 
     def _release(self, run):
-        """Give the denoiser back once no model call uses it (a slow or cancelled call may still run)."""
+        """Give the denoiser back once no model call uses it (a slow or cancelled call may still run).
+        Once per stream: at a fallback, else when the stream ends."""
+        denoiser, run.denoiser = run.denoiser, None
+        if denoiser is None:
+            return
+
         def give_back():
-            if not self.pool.release(run.denoiser, broken=run.broken):
+            if not self.pool.release(denoiser, broken=run.broken):
                 try:
                     self._loader.submit(self.pool.replace)
                 except RuntimeError:        # closed: the server is stopping

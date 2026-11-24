@@ -37,9 +37,11 @@ message AudioChunk {
                                         // media.codec: absent/LEGACY_ENCODED = already encoded for the session codec, today
                                         // only G.711 PCMU 8 kHz (codec pcm; the gateway offers PCMU only), PCM_S16LE =
                                         // raw PCM 16 kHz (codec g722 | l16). The gateway sends it on every chunk, for
-                                        // every task, fixed for a stream. speech_to_text ignores it (its results carry
-                                        // text only); noise_reduction takes it from the first chunk and ends the stream
-                                        // with INVALID_ARGUMENT on another value or a change
+                                        // every task, fixed for a stream. speech_to_text returns text only; with
+                                        // asr_denoise on, PCM_S16LE on its first chunk marks a G.722/L16 call, the only
+                                        // calls denoised before VAD/ASR (asr_denoise.apply_to: wideband). noise_reduction
+                                        // takes it from the first chunk and ends the stream with INVALID_ARGUMENT on
+                                        // another value or a change
 }
 
 message RecognitionResult {

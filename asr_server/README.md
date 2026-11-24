@@ -115,7 +115,7 @@ message: the first chunk fixes the stream.
 | `language` | `vi`, `en`, `auto` or empty. Empty and unknown codes (logged) take `asr.default_language`; `auto` lets the model detect the language. With `asr.force_language: false` (default) the model detects the language anyway, so this is only the value reported until the model names one. Read from the first chunk only. |
 | `language_source` | Used instead of `language` only when `asr.use_language_source: true`. |
 | `task` | `speech_to_text` or empty; `noise_reduction` when `noise_reduction.enabled: true`. A task that is off and the gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. The first chunk picks the task; it must not change. |
-| `output_audio_format` | Tag 14, ignored by `speech_to_text`. The format the gateway accepts for returned audio: absent/`LEGACY_ENCODED` = G.711 PCMU, `PCM_S16LE` = raw PCM 16 kHz (gateway `media.codec` g722 or l16). Used by `noise_reduction`, see below. |
+| `output_audio_format` | Tag 14. `speech_to_text` returns no audio; with `asr_denoise` on, `PCM_S16LE` marks a G.722/L16 call, the only calls denoised before VAD/ASR by default (see below). The format the gateway accepts for returned audio: absent/`LEGACY_ENCODED` = G.711 PCMU, `PCM_S16LE` = raw PCM 16 kHz (gateway `media.codec` g722 or l16). Used by `noise_reduction`, see below. |
 
 Send audio at real-time pace. The engine never slows the sender down; if more
 than `server.ingress_max_ms` of audio is waiting for ASR the RPC ends with
@@ -252,6 +252,60 @@ Measured on a laptop CPU (sherpa-onnx 2.0.2, one ONNX thread per denoiser): firs
 audio 16 ms after the first chunk, 13-21 ms of model time per 80 ms chunk, the same
 output whatever the chunk size. Measure on the target CPU before choosing
 `max_streams` and `workers`.
+
+### `asr_denoise`: DPDFNet-2 in front of VAD and ASR (optional)
+
+Design: `../docs/DPDFNet2_STT_Denoise_VI.md`.
+
+With `asr_denoise.enabled: true` (default `false`), the audio of a `speech_to_text`
+stream goes through DPDFNet-2 before VAD and ASR (`stt_denoise.py`). The contract
+above does not change: the same requests, results, commits and status codes, and no
+new proto field. The checks of the request rules still see the chunks as sent.
+
+- **Which streams.** With `apply_to: wideband` (default), only the streams whose first
+  chunk has `output_audio_format: PCM_S16LE` and `sample_rate: 16000` are denoised. The
+  gateway sends that for G.722 and L16 calls. G.711 calls go through as sent: on
+  band-limited audio DPDFNet-2 turned down much of the speech
+  (`../docs/DPDFNet2_STT_Denoise_VI.md`, section 3).
+  `apply_to: all` denoises every 16 kHz stream; use it only for tests, for example with
+  `tools/eval`, which sends no `output_audio_format`. 8 kHz streams are never denoised.
+- **Timeline.** DPDFNet-2 delays audio by 40 ms (640 samples). The engine removes that
+  delay, so VAD and ASR get exactly as many samples as were sent, on the same timeline:
+  `ts_start`/`ts_end` do not move. At start the server checks the delay with one click
+  through the model and refuses a model file whose delay is not 640 samples. The real
+  latency of PARTIAL and FINAL results still grows by about 40 ms plus the model time.
+- **State.** One denoiser per stream, borrowed from `asr_denoise.max_streams` denoisers
+  loaded at start (a pool of its own, not shared with `noise_reduction`). Its state is
+  kept for the whole stream, silences and commits included. It is flushed once, at
+  `end_of_stream` or half-close, before the ASR core gets the end of the stream.
+- **Audio is never lost.** A stream that finds no denoiser free is recognised from the
+  audio as sent; a WARNING is logged for the first 3 such streams, then every 500th.
+  In three cases the stream goes on with the audio as sent from the next sample, and
+  the audio the model still held comes first, so nothing is lost or repeated:
+  - the model fails (`reason=model_error`; the denoiser is dropped and a new one loaded);
+  - one model call takes longer than `max_backlog_ms` (`model_slow`), or has not started
+    within it because every worker thread is busy (`busy`);
+  - more than `max_backlog_ms` of audio waits for the model (`backlog`).
+  Each fallback logs one WARNING `stt_denoise fallback session=... reason=... at_sample=...`,
+  and the denoiser goes back to the pool at once, for other calls. `max_backlog_ms: 0`
+  turns these limits off (test servers sending faster than real time only): a stuck model
+  call would then hold the stream and its audio would wait with no bound.
+- One INFO line per stream: `stt_denoise stream ended session= stream=
+  outcome=denoised|fallback|cancelled|error reason= chunks= samples_in= samples_out=
+  model_ms_p50= model_ms_p95= model_ms_max= backlog_ms_max=`.
+
+Measured on a laptop CPU (12 threads; sherpa-onnx 2.0.2, `dpdfnet2.onnx`):
+- **Throughput.** One stream runs 4.1x real time. The whole CPU saturates at about 10-12x
+  real time, so about 10 streams at once. Then the model time per 80 ms chunk reaches
+  p95 46-105 ms. Size `max_streams` and `workers` on the server CPU, after the ASR's
+  own CPU use.
+- **VAD** (webrtcvad; Silero not measured). On 6 VoiceBank samples with the clean file
+  as reference, false alarms fell from 31% to 5% of the non-speech frames. Missed speech
+  fell from 7.6% to 6.2% overall, but rose in 2 of the 6 files (0.6% to 8.3%, and 5.6%
+  to 9.3%).
+- **Unknown here.** The effect on WER needs the GPU server. Compare `tools/eval` runs with
+  `asr_denoise` off and on (`apply_to: all`) on the same recordings before turning it
+  on in production.
 
 ### Status codes
 

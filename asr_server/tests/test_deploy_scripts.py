@@ -127,6 +127,45 @@ def test_missing_noise_model_is_reported(source, tmp_path):
     assert 'copy the missing models' in result.stdout
 
 
+def _set_asr_denoise(home, model=None):
+    """Turn asr_denoise on in the run directory's server.yaml; `model` replaces its model path."""
+    config = home / 'config' / 'server.yaml'
+    text = config.read_text()
+    line = '  enabled: false             # false: VAD and ASR get the audio as sent.'
+    assert line in text
+    text = text.replace(line, line.replace('false', 'true ', 1))
+    if model is not None:
+        section = text.index('asr_denoise:')
+        text = text[:section] + text[section:].replace(f'model: {home}/model/dpdfnet2.onnx', f'model: {model}', 1)
+    config.write_text(text)
+
+
+def test_missing_asr_denoise_model_is_reported(source, tmp_path):
+    home = tmp_path / 'app'
+    assert update(source, home).returncode == 0
+    _set_asr_denoise(home, model=f'{home}/model/stt-dpdfnet2.onnx')
+    result = update(source, home, '--no-build')
+    assert result.returncode == 0, result.stderr
+    assert f'MISSING  DPDFNet-2 model file (asr_denoise.model): {home}/model/stt-dpdfnet2.onnx' in result.stdout
+    if not _sherpa_installed():
+        assert 'MISSING  Python package sherpa-onnx==2.0.2 (asr_denoise.enabled;' in result.stdout
+    assert 'copy the missing models' in result.stdout
+
+
+def test_one_sherpa_report_for_both_denoising_settings(source, tmp_path):
+    home = tmp_path / 'app'
+    assert update(source, home).returncode == 0
+    _set_tasks(home, asr=True, noise=True)
+    _set_asr_denoise(home)
+    (home / 'model' / 'dpdfnet2.onnx').write_bytes(b'onnx')
+    result = update(source, home, '--no-build')
+    assert result.returncode == 0, result.stderr
+    assert 'DPDFNet-2 model file' not in result.stdout          # one file, present, for both
+    if not _sherpa_installed():
+        assert result.stdout.count('MISSING  Python package sherpa-onnx') == 1
+        assert '(noise_reduction.enabled and asr_denoise.enabled;' in result.stdout
+
+
 def _set_model_paths(home, asr, punct):
     config = home / 'config' / 'server.yaml'
     text = config.read_text()
