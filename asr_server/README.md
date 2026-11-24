@@ -229,8 +229,9 @@ stream; another value than `LEGACY_ENCODED` / `PCM_S16LE`, or a change, is
   the chunks not yet given to the model: while one chunk is in the model, a burst of
   7 chunks of 80 ms (6 waiting, 480 ms) passes and 8 do not. It also counts a
   gateway that reads the results slowly. `0` turns the limit off (at most 5000); set
-  it on a test server whose client sends faster than real time. Whatever the limit,
-  at most 64 chunks are read ahead; gRPC flow control holds back the rest. A gateway
+  it on a test server whose client sends faster than real time. With the limit off,
+  at most 64 chunks are read ahead and gRPC flow control holds back the rest. The
+  `end_of_stream` chunk is never refused by the limit: the stream ends with it. A gateway
   with `noise_reduction.on_ai_failure: close` retries `RESOURCE_EXHAUSTED` up to
   `ai.max_retry` times, then closes the session.
 - A chunk above 64 KB ends the stream with `RESOURCE_EXHAUSTED`, as for

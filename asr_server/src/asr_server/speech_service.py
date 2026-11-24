@@ -19,6 +19,7 @@ Contract enforced here (see README, "gRPC contract"):
   rtp_timestamp of the chunk that carried the audio: when a chunk's rtp_timestamp does not
   continue from the audio received so far, the timeline is re-anchored at that chunk.
 """
+from contextlib import aclosing
 import logging
 
 import grpc
@@ -247,8 +248,11 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
         # The task of the first chunk picks the pipeline.
         first = await anext(request_iterator, None)
         if first is not None and first.task == NOISE_TASK and self.noise is not None:
-            async for result in self.noise.Recognize(first, request_iterator, context):
-                yield result
+            # aclosing: when this RPC is closed or cancelled, the noise stream is closed at once and
+            # gives its denoiser back (not later, from a garbage-collector finalizer).
+            async with aclosing(self.noise.Recognize(first, request_iterator, context)) as results:
+                async for result in results:
+                    yield result
             return
         if self.core is None:
             await self._refuse_without_asr(first, context)
@@ -286,8 +290,9 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
         if self.word_reveal is not None:
             transcripts = paced_transcripts(transcripts, WordPacer(*self.word_reveal))
         try:
-            async for transcript in transcripts:
-                yield self._result(holder['stream'], transcript)
+            async with aclosing(transcripts) as results:   # closes the core's stream with this RPC
+                async for transcript in results:
+                    yield self._result(holder['stream'], transcript)
         except ProtocolError as exc:
             LOG.warning('protocol error: %s', exc.details)
             await context.abort(exc.code, exc.details)

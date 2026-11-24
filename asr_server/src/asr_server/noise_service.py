@@ -36,8 +36,8 @@ SAMPLE_RATE = 16000
 # speech.proto AudioFormat (PCM_S16LE = 1), not messages.PCM_S16LE (= 3) of the speech_to_text core.
 OUTPUTS = {pb.AudioFormat.LEGACY_ENCODED: OUTPUT_PCMU, pb.AudioFormat.PCM_S16LE: OUTPUT_PCM16}
 MAX_CHUNK_BYTES = 64000             # as speech_to_text (server.py): 2 s of audio
-# Chunks read ahead at most, whatever max_backlog_ms says (0 = no limit): further chunks stay
-# with gRPC, whose flow control then holds the client back.
+# Chunks read ahead at most when max_backlog_ms is 0 (no limit): further chunks stay with gRPC,
+# whose flow control then holds the client back. With a limit, the limit bounds the queue.
 MAX_QUEUED_CHUNKS = 64
 
 
@@ -118,12 +118,15 @@ class NoiseReductionService:
         self.refused = 0                    # streams refused because no denoiser was free
         self.backlogged = 0                 # streams ended by max_backlog_ms
         # Model calls of all streams; those of one stream run one at a time (each is awaited).
-        # Loading a denoiser in place of a dropped one runs here too.
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='denoise')
+        # Loading a denoiser in place of a dropped one (about 0.3 s) has its own thread, so that
+        # it never holds up the model calls of the other streams.
+        self._loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix='denoise-load')
 
     def close(self):
         """Call after the gRPC server has stopped: later model calls fail with UNAVAILABLE."""
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._loader.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ input
     @staticmethod
@@ -173,12 +176,14 @@ class NoiseReductionService:
         MAX_QUEUED_CHUNKS are queued. Always leaves an item that ends the stream's wait."""
         try:
             async for chunk in request_iterator:
-                await state.slots.acquire()
+                if not self.max_backlog_ms:
+                    await state.slots.acquire()
                 state.waiting_samples += len(chunk.pcm) // 2
                 waiting_ms = state.waiting_samples * 1000 // SAMPLE_RATE
                 state.backlog_ms_max = max(state.backlog_ms_max, waiting_ms)
                 queue.put_nowait(chunk)
-                if self.max_backlog_ms and waiting_ms > self.max_backlog_ms:
+                # The end_of_stream chunk is let through: the stream ends with it anyway.
+                if self.max_backlog_ms and waiting_ms > self.max_backlog_ms and not chunk.end_of_stream:
                     state.backlog = (f'{waiting_ms} ms of audio waiting to be processed, above '
                                      f'noise_reduction.max_backlog_ms {self.max_backlog_ms}')
                     return
@@ -191,14 +196,14 @@ class NoiseReductionService:
             return
         queue.put_nowait(_EOF)
 
-    @staticmethod
-    def _take(state, item):
+    def _take(self, state, item):
         """The next chunk out of the queue, or None at the half-close."""
         if state.backlog is not None:
             raise Backlog(state.backlog)
         if item is _EOF:
             return None
-        state.slots.release()
+        if not self.max_backlog_ms:
+            state.slots.release()
         state.waiting_samples -= len(item.pcm) // 2
         return item
 
@@ -242,7 +247,7 @@ class NoiseReductionService:
         def give_back():
             if not self.pool.release(denoiser, broken=broken):
                 try:
-                    self._executor.submit(self.pool.replace)
+                    self._loader.submit(self.pool.replace)
                 except RuntimeError:        # service closed
                     pass
         job = state.job

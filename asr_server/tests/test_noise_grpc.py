@@ -752,3 +752,88 @@ def test_stream_summary_is_logged(caplog):
     # review L3: time in the model and time waiting for a worker thread are told apart
     assert 'model_ms_p95=' in line[0] and 'queue_ms_p95=' in line[0] and 'samples_sent=16000' in line[0]
     assert 'backlog_ms_max=' in line[0]
+
+
+# ------------------------------------------------------------- review of the branch
+def test_a_backlog_limit_above_64_short_chunks_still_ends_the_stream():
+    # review (important): the reader waited for one of 64 queue slots before counting a chunk,
+    # so with 20 ms chunks no more than 1280 ms could ever wait and a limit of 2000 never fired
+    async def fast_client():
+        for message in noise_chunks(DATA * 10, chunk_bytes=640):
+            yield message
+    svc = noise_service(size=1, factory=BlockingDenoiser, max_backlog_ms=2000)
+    model = svc.pool._free[0]
+
+    async def go():
+        task = asyncio.create_task(_outcome(SpeechStreamService(None, noise=svc), fast_client()))
+        await asyncio.to_thread(model.started.wait, 5)
+        await asyncio.sleep(0.3)
+        model.go.set()
+        code, _ = await asyncio.wait_for(task, 20)
+        return code
+    try:
+        assert asyncio.run(go()) == grpc.StatusCode.RESOURCE_EXHAUSTED
+    finally:
+        model.go.set()
+        svc.close()
+
+
+def test_closing_the_rpc_gives_the_denoiser_back_at_once():
+    # review (important): the inner generator was only closed later by a finalizer, so a new
+    # call could get RESOURCE_EXHAUSTED while no stream used the denoiser
+    async def go():
+        svc = noise_service(size=1)
+        try:
+            results = SpeechStreamService(None, noise=svc).Recognize(as_stream(noise_chunks()), FakeContext())
+            await anext(results)                    # suspended at a yield of the noise stream
+            await results.aclose()
+            return svc.pool.free
+        finally:
+            svc.close()
+    assert asyncio.run(go()) == 1
+
+
+class SlowToLoad:
+    """Denoisers that fail on their third call; loading one after the first two takes 0.5 s."""
+
+    def __init__(self):
+        self.made = 0
+
+    def __call__(self):
+        self.made += 1
+        if self.made > 2:
+            time.sleep(0.5)
+        return FailingDenoiser()
+
+
+def test_loading_a_replacement_denoiser_does_not_stall_other_streams():
+    # review: replace() ran on the model threads; with workers=1 every stream waited 0.3 s
+    svc = NoiseReductionService(DenoiserPool(SlowToLoad(), 2), frame_ms=20, workers=1, max_backlog_ms=0)
+
+    async def go():
+        service = SpeechStreamService(None, noise=svc)
+        code, _ = await _outcome(service, as_stream(noise_chunks(stream='a')))
+        assert code == grpc.StatusCode.UNAVAILABLE          # its denoiser is being replaced
+        started = time.monotonic()
+        code, out = await _outcome(service, as_stream(noise_chunks(DATA[:2560 * 2], stream='b')))
+        return code, time.monotonic() - started
+    try:
+        code, seconds = asyncio.run(go())
+    finally:
+        svc.close()
+    assert code == grpc.StatusCode.OK and seconds < 0.3
+
+
+def test_end_of_stream_chunk_over_the_limit_still_ends_with_the_final():
+    # review: the last chunk pushed the backlog over the limit, so the stream was aborted
+    # instead of flushed (3 chunks at once: the third, end_of_stream, makes 160 ms > 100 ms)
+    svc = noise_service(max_backlog_ms=100)
+
+    async def go():
+        return await _outcome(SpeechStreamService(None, noise=svc),
+                              as_stream(noise_chunks(DATA[:2560 * 3])))
+    try:
+        code, out = asyncio.run(go())
+    finally:
+        svc.close()
+    assert code == grpc.StatusCode.OK and out[-1].is_final
