@@ -25,18 +25,21 @@ message AudioChunk {
   bool   end_of_stream  = 8;
   string language       = 9; // speech_to_text: source language (empty = auto). realtime_translation: TARGET language (vi|en); the source is detected
   string task           = 10; // the gateway sends speech_to_text | realtime_translation | keyword | voice_controller_emoji | noise_reduction;
-                              // this engine serves speech_to_text only and ends the others with UNIMPLEMENTED
+                              // this engine serves speech_to_text (asr.enabled) and noise_reduction (noise_reduction.enabled)
+                              // and ends the others, or a task that is off, with UNIMPLEMENTED
                               // (noise_reduction design: audio-engine repo root, docs/DPDFNet2_Task_Routing_Design_VI.md)
-  uint32 rtp_clock_rate = 11; // RTP clock Hz (e.g. 8000 for G.711, 0 = infer from sample_rate). int32 in the gateway's file: same wire format
+  uint32 rtp_clock_rate = 11; // RTP clock Hz of the session codec: 8000 for G.711 and G.722 (RFC 3551), 16000 for L16;
+                              // 0 = infer from sample_rate. int32 in the gateway's file: same wire format
   int64  chunk_seq      = 12; // monotonic per stream (0-based); a gap means the gateway dropped chunks: logged, processing goes on.
                               // -1 = not provided. uint64 in the gateway's file: same wire format
   string language_source = 13; // SOURCE language hint (vi|en); empty = not provided. Used only when asr.use_language_source is on; it overrides `language` for transcribe and fixes the ASR source for translate (empty = auto)
   AudioFormat output_audio_format = 14; // format the gateway's egress accepts in RecognitionResult.audio_payload, from its
                                         // media.codec: absent/LEGACY_ENCODED = already encoded for the session codec, today
                                         // only G.711 PCMU 8 kHz (codec pcm; the gateway offers PCMU only), PCM_S16LE =
-                                        // raw PCM 16 kHz (codec g722 | l16). The gateway sends it on every chunk, fixed
-                                        // for a stream; this engine does not check that yet (speech_to_text ignores it;
-                                        // noise_reduction must lock it at the first chunk, see the design doc)
+                                        // raw PCM 16 kHz (codec g722 | l16). The gateway sends it on every chunk, for
+                                        // every task, fixed for a stream. speech_to_text ignores it (its results carry
+                                        // text only); noise_reduction takes it from the first chunk and ends the stream
+                                        // with INVALID_ARGUMENT on another value or a change
 }
 
 message RecognitionResult {
@@ -44,8 +47,9 @@ message RecognitionResult {
   string stream_id      = 2;
   string text           = 3;
   bool   is_final       = 4;
-  int64  ts_start       = 5;
-  int64  ts_end         = 6;
+  int64  ts_start       = 5;  // RTP timestamps on the timeline of AudioChunk.rtp_timestamp, modulo 2^32, in ticks of
+  int64  ts_end         = 6;  // rtp_clock_rate: 8 per ms for G.711 and G.722, 16 per ms for L16. The gateway passes
+                              // them to MF unchanged
   float  confidence     = 7;
   string language       = 8;
   uint64 seq            = 9;

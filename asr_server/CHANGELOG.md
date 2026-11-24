@@ -62,6 +62,10 @@
 - A refused update writes the new defaults to `config/*.dist.new` and leaves `config/*.dist` alone.
 - A stream without a language took the fixed `Vietnamese`; it now takes `asr.default_language`
   (same result with the default `vi`). The `start` log line shows the language of the stream.
+- `speech.proto` comments and README: the engine also serves `noise_reduction`; `speech_to_text`
+  ignores `output_audio_format`; `ts_start`/`ts_end` are ticks of `rtp_clock_rate` (8 per ms for
+  G.711 and G.722, 16 for L16). Comments only: `speech_pb2.py` is unchanged. Two tests cover
+  `speech_to_text` with the chunks the gateway sends for G.722 and L16 sessions.
 
 ### Fixed
 

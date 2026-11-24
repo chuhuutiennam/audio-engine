@@ -108,7 +108,7 @@ message: the first chunk fixes the stream.
 | `sample_rate` | `16000` (or `8000`; `noise_reduction`: `16000` only). Must not change. |
 | `channels` | `1` (unset is accepted). |
 | `rtp_timestamp` | RTP timestamp of the **first sample** of the chunk, on the source clock. The first chunk anchors the timeline. A later value that does not continue from the audio received (a jump) re-anchors the timeline at that chunk and is logged at WARNING (the first 3 jumps of a stream, then every 500th); processing goes on. |
-| `rtp_clock_rate` | Source RTP clock, `8000` for G.711. `0` means "use `sample_rate`" as the proto defines, and is logged at WARNING. Must not change. |
+| `rtp_clock_rate` | Source RTP clock: `8000` for G.711 and for G.722 (its RTP clock stays 8 kHz although the audio is 16 kHz, RFC 3551), `16000` for L16. `0` means "use `sample_rate`" as the proto defines, and is logged at WARNING. Must not change. |
 | `chunk_seq` | Normally increases by 1 from its first value. A gap means the gateway dropped chunks from its send queue: it is logged at WARNING (the first 3 gaps of a stream, then every 500th) and processing goes on with the audio that arrived. `-1` on the first chunk turns the check off. |
 | `duration_ms` | Informational; the duration is computed from `pcm`. |
 | `end_of_stream` | `true`: the audio in this chunk is processed, the open utterance is committed, the stream is closed. Nothing after it is read. Closing the request stream without it has the same effect. |
@@ -132,7 +132,7 @@ chunks: resampling each 80 ms chunk on its own creates discontinuities.
 | `utterance_id` (20) | Starts at 1. All PARTIALs up to a FINAL carry that FINAL's id. | Advances by 1 after each FINAL. |
 | `revision` (21) | Increases with every result of the utterance | Last revision + 1; restarts at 1 for the next utterance |
 | `seq` | Starts at 1, +1 for every result of the stream, no gaps | same |
-| `ts_start`, `ts_end` | RTP timestamps on the source clock, **modulo 2^32**, half-open `[ts_start, ts_end)`. Derived from the `rtp_timestamp` of the chunk that carried the audio (the latest anchor at or before that position) and the audio position; when `rtp_timestamp` jumped inside an utterance, `ts_start` is on the old timeline and `ts_end` on the new one. From VAD, **not** word timestamps; pre-roll and hangover are included. After a wrap `ts_end` is numerically smaller than `ts_start`. | same; `ts_end` is the end of the utterance |
+| `ts_start`, `ts_end` | RTP timestamps on the source clock (`rtp_clock_rate`: 8 ticks per ms for G.711 and G.722, 16 for L16), **modulo 2^32**, half-open `[ts_start, ts_end)`. Derived from the `rtp_timestamp` of the chunk that carried the audio (the latest anchor at or before that position) and the audio position; when `rtp_timestamp` jumped inside an utterance, `ts_start` is on the old timeline and `ts_end` on the new one. From VAD, **not** word timestamps; pre-roll and hangover are included. After a wrap `ts_end` is numerically smaller than `ts_start`. | same; `ts_end` is the end of the utterance |
 | `language` | `vi` or `en`: the forced language, else the language the model reports, else the one of the stream. Empty when the model reports any other language (logged at WARNING, the utterance is processed normally), or names none on an `auto` stream. | same |
 | `reason` (23) | `COMMIT_REASON_UNSPECIFIED` | See below |
 | `status` (24) | `RESULT_STATUS_OK` | `RESULT_STATUS_OK` (other values are reserved) |
