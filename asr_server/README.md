@@ -194,6 +194,14 @@ is denoised by DPDFNet-2 (sherpa-onnx `OnlineSpeechDenoiser`, CPU) and the audio
 the gateway, which plays it to the other party. Design:
 `../docs/DPDFNet2_Task_Routing_Design_VI.md`.
 
+Use it for wideband calls only (gateway `media.codec` g722 or l16). On the band-limited
+audio of a G.711 call, DPDFNet-2 turns many loud passages down by more than 20 dB. In one
+test file all speech was lost (−84.6 dBFS out for −27.7 dBFS in). On real G.711 calls,
+5 of 11 streams lost 31–54% of their loudest frames. The gateway cannot detect this,
+because audio keeps coming back. So rtpgw does not use `noise_reduction` for `media.codec`
+pcm (design doc §3.3). The engine still serves a stream that asks for PCMU
+(`output_audio_format` absent), for compatibility.
+
 On top of the request rules above: `sample_rate` must be `16000`, and
 `output_audio_format` (tag 14) fixes the format of the returned audio for the whole
 stream; another value than `LEGACY_ENCODED` / `PCM_S16LE`, or a change, is

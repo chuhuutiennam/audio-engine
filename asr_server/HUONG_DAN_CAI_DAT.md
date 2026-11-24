@@ -244,6 +244,8 @@ Muốn tắt, đặt lại `force_language: false` và khởi động lại.
 
 Gateway gửi stream có `task=noise_reduction` khi DCSF chọn dịch vụ này. Server lọc nhiễu từng chunk rồi trả audio về cho Gateway phát tiếp; Gateway tự phát audio gốc khi server tắt dịch vụ, lỗi, hoặc không trả audio quá 500 ms. Thiết kế: `docs/DPDFNet2_Task_Routing_Design_VI.md` ở gốc repo.
 
+**Chỉ dùng cho cuộc gọi G.722/L16** (Gateway chạy `media.codec: g722` hoặc `l16`). Với cuộc gọi G.711, audio chỉ có dải dưới 4 kHz, và DPDFNet-2 làm nhỏ hẳn nhiều đoạn có tiếng; có file mất toàn bộ lời nói. Gateway không phát hiện được vì server vẫn trả audio đều đặn, nên người nghe chỉ nhận im lặng. Vì vậy rtpgw không dùng `noise_reduction` cho `media.codec: pcm`; việc này cấu hình ở phía rtpgw/DCSF, không ở server này. Số liệu đo nằm ở mục 3.3 của tài liệu thiết kế.
+
 | Khóa | Mặc định | Ý nghĩa |
 |---|---|---|
 | `noise_reduction.enabled` | `false` | `true`: phục vụ `noise_reduction`. Cần gói `sherpa-onnx` và file model. |
