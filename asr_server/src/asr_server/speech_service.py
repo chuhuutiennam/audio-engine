@@ -3,6 +3,9 @@
 AudioChunk  -> messages.StreamRequest   (config taken from the first chunk)
 Transcript  -> RecognitionResult        (RTP ticks, language codes, seq, reason enum)
 
+The task of the first chunk picks the pipeline: noise_reduction goes to
+noise_service.NoiseReductionService when it is on; everything below is speech_to_text.
+
 Contract enforced here (see README, "gRPC contract"):
 - one RPC carries one (session_id, stream_id); the session fields of the first
   chunk must not change;
@@ -16,6 +19,7 @@ Contract enforced here (see README, "gRPC contract"):
   rtp_timestamp of the chunk that carried the audio: when a chunk's rtp_timestamp does not
   continue from the audio received so far, the timeline is re-anchored at that chunk.
 """
+from contextlib import aclosing
 import logging
 
 import grpc
@@ -23,6 +27,7 @@ import grpc
 from . import messages as m
 from .proto import speech_pb2 as pb
 from .proto import speech_pb2_grpc as pb_grpc
+from .word_pacer import WordPacer, paced_transcripts
 
 LOG = logging.getLogger('qwen3_asr.grpc.vad')
 
@@ -34,10 +39,13 @@ ANCHOR_HISTORY_MS = 60000
 # speech.proto language code <-> language name used by the model
 LANGUAGE_NAMES = {'vi': 'Vietnamese', 'en': 'English'}
 LANGUAGE_CODES = {name.lower(): code for code, name in LANGUAGE_NAMES.items()}
+AUTO_CODE = 'auto'      # the model detects the language; never sent back to the client
 
 SUPPORTED_TASKS = ('', 'speech_to_text')
-# Tasks the gateway may route here that this engine does not implement.
-OTHER_GATEWAY_TASKS = ('realtime_translation', 'keyword', 'voice_controller_emoji')
+# Served by noise_service.NoiseReductionService when noise_reduction.enabled is true.
+NOISE_TASK = 'noise_reduction'
+# Tasks the gateway may route here that this engine does not implement (or has off).
+OTHER_GATEWAY_TASKS = ('realtime_translation', 'keyword', 'voice_controller_emoji', NOISE_TASK)
 
 REASONS = {
     'vad_endpoint': pb.COMMIT_REASON_SILENCE,
@@ -113,9 +121,14 @@ class _Stream:
 
 
 class SpeechStreamService(pb_grpc.SpeechStreamServicer):
-    def __init__(self, core, *, use_language_source=False):
+    def __init__(self, core, *, use_language_source=False, word_reveal=None, noise=None):
+        """`core`: the speech_to_text core (server.ASRService); None = asr.enabled is false.
+        `word_reveal`: (window_ms, min_interval_ms) to reveal PARTIALs word by word; None = off.
+        `noise`: noise_service.NoiseReductionService; None = noise_reduction is off."""
         self.core = core
         self.use_language_source = bool(use_language_source)
+        self.word_reveal = word_reveal
+        self.noise = noise
 
     # ------------------------------------------------------------------ input
     def _language_code(self, chunk):
@@ -140,7 +153,7 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
             raise ProtocolError(grpc.StatusCode.INVALID_ARGUMENT,
                                 f'pcm must be mono, got channels={chunk.channels}')
         code = self._language_code(chunk)
-        if code and code not in LANGUAGE_NAMES:
+        if code and code != AUTO_CODE and code not in LANGUAGE_NAMES:
             LOG.warning('unknown language code %r session=%s stream=%s; using the server default',
                         code, chunk.session_id, chunk.stream_id)
         stream = _Stream(chunk, code)
@@ -232,18 +245,37 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
 
     # -------------------------------------------------------------------- rpc
     async def Recognize(self, request_iterator, context):
+        # The task of the first chunk picks the pipeline.
+        first = await anext(request_iterator, None)
+        if first is not None and first.task == NOISE_TASK and self.noise is not None:
+            # aclosing: when this RPC is closed or cancelled, the noise stream is closed at once and
+            # gives its denoiser back (not later, from a garbage-collector finalizer).
+            async with aclosing(self.noise.Recognize(first, request_iterator, context)) as results:
+                async for result in results:
+                    yield result
+            return
+        if self.core is None:
+            await self._refuse_without_asr(first, context)
+            return
         holder = {}
+
+        async def chunks():
+            if first is not None:
+                yield first
+                async for chunk in request_iterator:
+                    yield chunk
 
         async def requests():
             stream = None
             sequence = 0
-            async for chunk in request_iterator:
+            async for chunk in chunks():
                 if stream is None:
                     stream = holder['stream'] = self._open(chunk)
                     yield m.StreamRequest(config=m.StreamConfig(
                         call_id=stream.session_id, leg_id=stream.stream_id,
                         encoding=m.PCM_S16LE, sample_rate=stream.sample_rate,
-                        language=LANGUAGE_NAMES.get(stream.language_code, '')))
+                        language=(m.AUTO_LANGUAGE if stream.language_code == AUTO_CODE
+                                  else LANGUAGE_NAMES.get(stream.language_code, ''))))
                 else:
                     self._check(stream, chunk)
                 self._accept(stream, chunk)
@@ -254,9 +286,26 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
                     yield m.StreamRequest(end_stream=m.EndStream())
                     return
 
+        transcripts = self.core.StreamRecognize(requests(), context)
+        if self.word_reveal is not None:
+            transcripts = paced_transcripts(transcripts, WordPacer(*self.word_reveal))
         try:
-            async for transcript in self.core.StreamRecognize(requests(), context):
-                yield self._result(holder['stream'], transcript)
+            async with aclosing(transcripts) as results:   # closes the core's stream with this RPC
+                async for transcript in results:
+                    yield self._result(holder['stream'], transcript)
         except ProtocolError as exc:
             LOG.warning('protocol error: %s', exc.details)
             await context.abort(exc.code, exc.details)
+
+    async def _refuse_without_asr(self, first, context):
+        """asr.enabled is false: the same checks as speech_to_text, then UNIMPLEMENTED."""
+        if first is None:
+            return
+        try:
+            self._open(first)
+        except ProtocolError as exc:
+            LOG.warning('protocol error: %s', exc.details)
+            await context.abort(exc.code, exc.details)
+            return
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED,
+                            'task speech_to_text is off on this engine (asr.enabled: false)')

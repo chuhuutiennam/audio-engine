@@ -25,6 +25,7 @@ Trình tự cài lần đầu: chuẩn bị model (mục 3) → up source (mục
 | Python | 3.10 trở lên | Project yêu cầu `>=3.10`. |
 | Gói Python | Các gói trong `requirements.txt`, cùng `torch` (bản CUDA) và `vllm[audio]` từ 0.16.0 | Tài liệu này coi như môi trường đã có sẵn; mục 5 kiểm tra lại. Thiếu gói thì xem Phụ lục A. |
 | Model | `Qwen3-ASR-1.7B`, `punctuation-restoration-small`, `silero_vad.jit` | Đặt trong `APP/model`. Server tự đặt chế độ offline và không tải gì từ mạng. |
+| Khử nhiễu (tùy chọn) | Gói `sherpa-onnx==2.0.2` và file `dpdfnet2.onnx` | Chỉ cần khi bật `noise_reduction.enabled` (mục 7.1). Chạy trên CPU, không cần GPU. |
 | CPU | Silero VAD và punctuation chạy trên CPU | Số đo trên máy thử 2 nhân: VAD khoảng 2% một nhân và 4,4 MiB RAM cho mỗi stream. |
 | Cổng | TCP 50051 (mặc định) | Không mã hóa, không xác thực: chỉ mở cho Gateway. |
 
@@ -43,11 +44,14 @@ Không cần: `qwen-asr`, `webrtcvad`, `onnxruntime`, gói Python `silero-vad`, 
 | Thư mục / file | Nội dung | Khi cập nhật |
 |---|---|---|
 | `bin/start.sh`, `stop.sh`, `status.sh` | Script chạy, dừng, xem trạng thái | Thay bằng bản mới |
+| `bin/rollback.sh`, `wait_ready.sh`, `_upgrade.sh` | Quay lại phiên bản đã lưu, chờ server sẵn sàng | Thay bằng bản mới; rollback không đưa các file này về bản cũ |
 | `bin/env.sh` | Thiết lập riêng của máy: đường dẫn Python, GPU | Tạo một lần, **không ghi đè** |
 | `config/server.yaml`, `logging.yaml` | Cấu hình đang dùng | Tạo một lần, **không ghi đè** |
 | `config/*.dist` | Cấu hình mặc định của phiên bản vừa cài, để so sánh | Thay bằng bản mới |
 | `lib/asr_server/` | Mã của ứng dụng | Thay bằng bản mới |
-| `lib/asr_server.prev/` | Mã của phiên bản ngay trước, để quay lại | Thay bằng bản vừa bị thay |
+| `lib/asr_server.prev/` | Mã của phiên bản ngay trước, để đối chiếu | Thay bằng bản vừa bị thay |
+| `backup/<ngày>-<giờ>/` | Các phiên bản đã bị thay: mã, `bin/`, `config/`, `VERSION`. Tên theo giờ UTC (giờ Việt Nam trừ 7); bản lưu trước khi đổi sang UTC mang giờ địa phương, bản mới luôn được đặt tên sau chúng | Thêm một bản, giữ tối đa 10 bản |
+| `backup/rolled-back/<ngày>-<giờ>/` | Các phiên bản bị thay khi rollback, để xem lại. Tên theo giờ UTC như `backup/` | Thêm một bản mỗi lần rollback, giữ tối đa 10 bản |
 | `logs/` | Log, file pid | Không đụng tới |
 | `model/` | Ba model | Không đụng tới |
 | `data/` | File audio thử, kết quả đo | Không đụng tới |
@@ -82,6 +86,16 @@ PY
 ```
 
 File TorchScript chứa mã thực thi: chỉ lấy từ nguồn chính thức của Silero.
+
+Chỉ khi dùng khử nhiễu (`noise_reduction`): tải model DPDFNet-2 16 kHz (khoảng 10 MB), kiểm tra SHA-256, và tải wheel `sherpa-onnx` cùng hệ điều hành và phiên bản Python với server:
+
+```bash
+curl -fL --retry 3 \
+  'https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet2.onnx' \
+  -o model/dpdfnet2.onnx
+echo 'ce35d6025fc71df0ef10d1540e1b7916837bbfe5f6896deb744508d2cad487a9  model/dpdfnet2.onnx' | sha256sum -c
+python -m pip download -d wheelhouse sherpa-onnx==2.0.2
+```
 
 Chép thư mục `model/` lên server ở bước 6.2.
 
@@ -156,17 +170,20 @@ copy the missing models, then start with: /u01/ims/audio-engine/bin/start.sh
 /u01/ims/audio-engine/model/
 ├── Qwen3-ASR-1.7B/                    (thư mục)
 ├── punctuation-restoration-small/     (thư mục)
-└── silero_vad.jit                     (file)
+├── silero_vad.jit                     (file)
+└── dpdfnet2.onnx                      (file, chỉ khi bật noise_reduction)
 ```
 
 ### 6.3. Thiết lập riêng của máy
 
-Chỉ cần sửa `/u01/ims/audio-engine/bin/env.sh` khi Python không phải `python3` mặc định, hoặc khi cần chọn GPU:
+Lần cài đầu, `/u01/ims/audio-engine/bin/env.sh` được tạo sẵn với các biến chạy offline và `CUDA_VISIBLE_DEVICES=0`. Chỉ cần sửa file này khi Python không phải `python3` mặc định, hoặc khi cần chọn GPU khác:
 
 ```bash
 PYTHON=/duong/dan/toi/venv/bin/python
 export CUDA_VISIBLE_DEVICES=0
 ```
+
+Máy đã cài từ trước vẫn giữ `bin/env.sh` cũ. Sau khi cập nhật, so sánh với `bin/env.sh.example` rồi thêm các dòng còn thiếu.
 
 ### 6.4. Kiểm tra lại
 
@@ -201,8 +218,60 @@ Các khóa cần xem khi cài:
 | `server.ingress_max_ms` | `3000` | Chỉ đặt `0` trên server thử khi đo tải bằng `--fast` (mục 10.2). |
 | `asr.partial_max_backlog_ms` | `500` | Audio của một stream chờ quá mức này thì bỏ lần nhận dạng PARTIAL. Chỉ đặt `0` khi đo tải bằng `--fast` (mục 10.2). |
 | `server.max_streams` | `64` | Là giới hạn của gRPC, **không phải** năng lực đã đo. |
+| `asr.chunk_sec` | `1.0` | Đặt `0.5` khi bật hiện từng từ. Lượng audio đưa vào model tăng khoảng 1,8–1,9 lần. |
+| `asr.log_results` | `false` | Đặt `true` để ghi ngôn ngữ và text của từng PARTIAL, COMMIT vào log (mục 12.1). Chỉ bật trong lúc phân tích: log chứa nội dung cuộc gọi, và các file đã ghi vẫn còn trên đĩa tối đa 14 ngày sau khi tắt cờ. |
+| `asr.default_language` | `vi` | Ngôn ngữ của stream khi rtpgw không gửi `language` hoặc gửi mã lạ: `vi`, `en` hoặc `auto` (model tự đoán). Thay cho giá trị `Vietnamese` viết cứng trước đây. |
+| `asr.force_language` | `false` | Đặt `true` để ép model nhận dạng theo ngôn ngữ của stream (`vi`, `en`) thay vì tự đoán; stream `auto` vẫn tự đoán. Chỉ áp dụng cho `asr.backend: native_vllm`. Thư mục model phải có chat template (`chat_template.json`, `chat_template.jinja` hoặc trong `tokenizer_config.json`), thiếu thì server không khởi động. |
+| `word_reveal.enabled` | `false` | Đặt `true` để chữ của PARTIAL hiện dần từng từ. |
+| `word_reveal.window_ms` | `400` | Thời gian tối đa để hiện hết các từ mới. Không được lớn hơn `asr.chunk_sec`. |
+| `word_reveal.min_interval_ms` | `120` | Khoảng cách tối thiểu giữa hai kết quả gửi đi trên một stream. |
+| `asr.enabled` | `true` | Đặt `false` khi server chỉ làm khử nhiễu: không nạp Qwen3-ASR, VAD, punctuation (không cần GPU); `speech_to_text` trả `UNIMPLEMENTED`. Phải bật ít nhất một trong `asr.enabled`, `noise_reduction.enabled`. |
+| `noise_reduction.*` | `enabled: false` | Khử nhiễu DPDFNet-2, xem mục 7.1. |
 
 Các khóa còn lại (VAD, punctuation, semantic) có chú thích ngay trong file; giữ mặc định cho lần chạy đầu.
+
+Bật hiện từng từ: sửa `asr.chunk_sec: 0.5` và `word_reveal.enabled: true` trong `config/server.yaml` của thư mục chạy, rồi chạy `bin/stop.sh` và `bin/start.sh`. `scripts/update.sh` không ghi đè file này. Muốn tắt, đặt lại hai giá trị cũ và khởi động lại.
+
+Bật ép ngôn ngữ: **sau khi** nâng cấp xong (code cũ từ chối khóa lạ), thêm `force_language: true` vào mục `asr` của `config/server.yaml` ở thư mục chạy, đổi `default_language` nếu cần, rồi chạy `bin/stop.sh` và `bin/start.sh`. Kiểm tra trong `logs/asr-server.log` (lệnh ở cuối mục 12.1):
+
+1. Có dòng `asr.force_language on`.
+2. Sau cuộc gọi đầu tiên có dòng `model prompt language=Vietnamese ends with '...<|im_start|>assistant\nlanguage Vietnamese<asr_text>'`.
+3. Các stream rtpgw gửi `vi` không còn dòng `model reported language`. Với `asr.log_results: true`, `model_output` không còn bắt đầu bằng `language ...<asr_text>`.
+
+Muốn tắt, đặt lại `force_language: false` và khởi động lại.
+
+### 7.1. Bật khử nhiễu (`noise_reduction`, DPDFNet-2)
+
+Gateway gửi stream có `task=noise_reduction` khi DCSF chọn dịch vụ này. Server lọc nhiễu từng chunk rồi trả audio về cho Gateway phát tiếp; Gateway tự phát audio gốc khi server tắt dịch vụ, lỗi, hoặc không trả audio quá 500 ms. Thiết kế: `docs/DPDFNet2_Task_Routing_Design_VI.md` ở gốc repo.
+
+| Khóa | Mặc định | Ý nghĩa |
+|---|---|---|
+| `noise_reduction.enabled` | `false` | `true`: phục vụ `noise_reduction`. Cần gói `sherpa-onnx` và file model. |
+| `noise_reduction.model` | `/u01/ims/audio-engine/model/dpdfnet2.onnx` (máy cài mới) | File model trên đĩa; server không tự tải. |
+| `noise_reduction.frame_ms` | `20` | Lượng audio mỗi kết quả trả về: `20`, `40` hoặc `80`. |
+| `noise_reduction.num_threads` | `1` | Số luồng ONNX của mỗi bộ lọc. |
+| `noise_reduction.workers` | `2` | Số luồng chạy model, dùng chung cho mọi stream. |
+| `noise_reduction.max_backlog_ms` | `500` | Audio chờ model vượt mức này (CPU không theo kịp) thì stream bị đóng (`RESOURCE_EXHAUSTED`) và Gateway phát audio gốc đến hết cuộc gọi, thay vì nhận audio ngày càng trễ. `0` = không giới hạn; chỉ đặt `0` trên server thử khi client gửi nhanh hơn thời gian thực. Tối đa `5000`. Ngắt nhầm thì mất khử nhiễu đến hết cuộc gọi, nên đừng đặt quá thấp: Gateway có thể gửi dồn nhiều chunk sau một lần nghẽn. Với `500`, trong lúc một chunk đang qua model, đợt dồn 7 chunk 80 ms (6 chunk chờ = 480 ms) vẫn qua, 8 chunk thì bị đóng. Audio cũng dồn khi Gateway đọc kết quả chậm. |
+| `noise_reduction.max_streams` | `16` | Số bộ lọc nạp sẵn lúc khởi động (mỗi bộ khoảng 20 MB RAM, 0,3 s). Stream thứ `max_streams + 1` bị từ chối ngay (`RESOURCE_EXHAUSTED`) và Gateway phát audio gốc. Không được lớn hơn `server.max_streams`. Chọn theo số đo trên CPU thật, không theo số cuộc gọi. |
+
+Các bước:
+
+1. Cài gói trên server: `python3 -m pip install --no-index --find-links=/duong/dan/wheelhouse sherpa-onnx==2.0.2`, rồi kiểm tra `python3 -c "import sherpa_onnx; print(sherpa_onnx.__version__, hasattr(sherpa_onnx, 'OnlineSpeechDenoiser'))"` in `2.0.2 True`.
+2. Chép `dpdfnet2.onnx` vào `/u01/ims/audio-engine/model/` và kiểm tra SHA-256 như ở mục 3.
+3. **Sau khi** nâng cấp lên bản có khử nhiễu (code cũ từ chối khóa lạ): máy cài mới đã có sẵn mục `noise_reduction` trong `config/server.yaml`; máy đã cài từ trước thì chép nguyên mục `noise_reduction` từ `config/server.yaml.dist` (đường dẫn model ở đó đã trỏ vào `APP/model`). Đặt `enabled: true`.
+4. Chạy `--check-config`, rồi `bin/stop.sh` và `bin/start.sh`. `scripts/update.sh` chỉ kiểm tra model của các task đang bật: thiếu thì báo `MISSING  DPDFNet-2 model file: ...` hoặc `MISSING  Python package sherpa-onnx==2.0.2 ...: <lý do>` (chưa cài, bản cũ không có `OnlineSpeechDenoiser`, hoặc thư viện native không nạp được); với `asr.enabled: false` không còn đòi model ASR, punctuation, Silero. Việc kiểm tra chạy trước khi thay đổi bất cứ thứ gì: nếu server đang chạy mà thiếu model thì `update.sh --restart` dừng lại, không dừng server, không cài (chép model rồi chạy lại). Đường dẫn model tương đối được tính từ thư mục chạy app.
+5. Kiểm tra trong `logs/asr-server.log`: lúc khởi động có dòng `noise_reduction on: 16 denoisers loaded in ... s`; sau mỗi cuộc gọi có dòng `noise_reduction stream ended ... outcome=final` (mục 12.1).
+
+Muốn tắt, đặt lại `enabled: false` và khởi động lại: Gateway nhận `UNIMPLEMENTED` và phát audio gốc.
+
+Kiểm tra trên máy cài, không cần Gateway (cần `pytest`; không cần GPU):
+
+```bash
+cd /u01/ims/namcht/audio-engine/asr_server
+ASR_TEST_DPDFNET2_MODEL=/u01/ims/audio-engine/model/dpdfnet2.onnx python3 -m pytest tests/test_noise_real_model.py -s
+```
+
+Kết quả `5 passed` và một dòng `noise_reduction stream ended ...` có `first_audio_ms`, `model_ms_p95`: số đo trên CPU của máy đó.
 
 Log cấu hình ở `config/logging.yaml`: file `logs/asr-server.log`, xoay vòng lúc nửa đêm, giữ 14 ngày. Muốn thấy các dòng `discard` và `empty final text`, đổi `root.level` thành `DEBUG`.
 
@@ -348,28 +417,54 @@ cd /u01/ims/namcht/audio-engine/asr_server
 bash scripts/update.sh --restart
 ```
 
-`--restart` dừng server, thay mã, rồi chạy lại. Các stream đang mở bị rớt; Gateway phải mở lại stream. Không có `--restart` mà server đang chạy thì `update.sh` từ chối và không đổi gì.
+`--restart` dừng server, thay mã, chạy lại rồi chờ server sẵn sàng. Các stream đang mở bị rớt; Gateway phải mở lại stream. Server đang dừng thì `--restart` cũng chạy server, trừ khi còn thiếu model. Không có `--restart` mà server đang chạy thì `update.sh` từ chối và không đổi gì.
 
 Thứ tự `update.sh` thực hiện:
 
 1. Build từ source.
-2. Kiểm tra cấu hình đang dùng trong APP bằng mã **mới**. Không hợp lệ (ví dụ phiên bản mới bỏ một khóa) thì dừng: báo lỗi, mã cũ còn nguyên, server không bị dừng. So `config/server.yaml` với `config/server.yaml.dist` để sửa rồi chạy lại.
-3. Dừng server (khi có `--restart`).
-4. Thay `lib/asr_server` và các script trong `bin/`; bản cũ chuyển thành `lib/asr_server.prev`.
-5. Chạy lại server (khi có `--restart`).
+2. Kiểm tra cấu hình đang dùng trong APP bằng mã **mới**. Không hợp lệ (ví dụ phiên bản mới bỏ một khóa) thì dừng: báo lỗi, mã cũ còn nguyên, server không bị dừng. So `config/server.yaml` với `config/server.yaml.dist.new` để sửa rồi chạy lại.
+3. Kiểm tra cấu hình đó bằng mã **đang cài**. Không hợp lệ thì dừng như trên, vì bản lưu sẽ không rollback được.
+4. Lưu phiên bản đang cài vào `backup/<ngày>-<giờ>/`, xóa các bản cũ vượt quá 10 bản. Bản gần nhất chạy tốt luôn được giữ lại, kể cả sau nhiều lần nâng cấp lỗi liên tiếp.
+5. Dừng server (khi có `--restart`).
+6. Thay `lib/asr_server` và các script trong `bin/`; bản cũ chuyển thành `lib/asr_server.prev`.
+7. Chạy lại server và chờ cổng gRPC mở (khi có `--restart`). Cổng chỉ mở sau khi nạp xong model.
 
 `config/server.yaml`, `config/logging.yaml`, `bin/env.sh`, `logs/`, `model/`, `data/` không bị đụng tới. Khóa cấu hình mới của phiên bản mới nhận giá trị mặc định; xem trong `config/server.yaml.dist`.
 
-**Quay lại phiên bản trước:**
+**Khóa cấu hình mới phải thêm sau khi nâng cấp xong.** Thêm trước thì bước 3 báo `unknown key` và dừng. Nếu mã đang cài bị hỏng nên không đọc được cấu hình, thêm `--ignore-old-config` để vẫn nâng cấp; bản lưu lần đó được đánh dấu `failed` và `rollback.sh` mặc định bỏ qua nó.
+
+**Khi nâng cấp lỗi:** `update.sh` báo `did not become ready; it was NOT rolled back` và trả mã thoát 1. Script **không tự rollback**, để bạn xem log trước:
+
+```bash
+tail -n 100 /u01/ims/audio-engine/logs/asr-server.log
+tail -n 100 /u01/ims/audio-engine/logs/asr-server.out
+```
+
+Server chưa mở cổng sau thời gian chờ vẫn được giữ chạy. Kiểm tra lại bằng `bin/wait_ready.sh`.
+
+**Quay lại phiên bản đã lưu:**
 
 ```bash
 cd /u01/ims/audio-engine
-bin/stop.sh
-mv lib/asr_server lib/asr_server.bad && mv lib/asr_server.prev lib/asr_server
-bin/start.sh
+bin/rollback.sh --list                # xem các bản đã lưu
+bin/rollback.sh                       # về bản đánh dấu "<- default"
+bin/rollback.sh 20261119-103000       # về bản chỉ định
 ```
 
-Chỉ giữ một phiên bản trước. `bin/` không được quay lại theo; nếu cần, cài lại từ source của phiên bản cũ.
+- Bản mặc định là bản mới nhất có `health=ok`. Nếu không có bản nào như vậy, script chọn bản mới nhất chưa có kết quả kiểm tra. Bản `failed` không bao giờ được chọn tự động. Muốn về bản khác, ghi rõ tên bản.
+- `rollback.sh` khôi phục mã, `bin/`, `config/`, `VERSION`, chạy lại server và chờ server sẵn sàng.
+- Phiên bản vừa bị thay, gồm mã và cấu hình, được giữ ở `backup/rolled-back/<ngày>-<giờ>/` để xem lại.
+- Cấu hình đã lưu không hợp lệ với mã đã lưu thì script dừng và không đổi gì.
+- Không quay lại được gói Python và model.
+
+Thiết lập trong `bin/env.sh`:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `ASR_BACKUP_KEEP` | `10` | Số phiên bản giữ trong `backup/`, tối thiểu 1 |
+| `ASR_START_WAIT_SEC` | `300` | Số giây chờ server sẵn sàng sau khi chạy lại. Đặt lớn hơn thời gian nạp model thật. `0` là chỉ kiểm tra tiến trình còn sống |
+
+Kiểm tra này chỉ phát hiện server chết hoặc không mở cổng. Lỗi nhận dạng sai text phải tự phát hiện rồi chạy `rollback.sh`.
 
 Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yaml`, chạy `--check-config` (mục 7), rồi `bin/stop.sh && bin/start.sh`.
 
@@ -381,7 +476,9 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 
 | Dòng log | Mức | Ý nghĩa |
 |---|---|---|
-| `start call=... leg=... rate=...` | INFO | Một stream mới. |
+| `start call=... leg=... rate=... codec=... language=...` | INFO | Một stream mới. `language`: ngôn ngữ của stream (`Vietnamese`, `English`) hoặc `auto`. Model chỉ bị ép theo ngôn ngữ này khi `asr.force_language: true`. |
+| `asr.force_language on: ...` | INFO | Lúc khởi động, khi bật ép ngôn ngữ. |
+| `model prompt language=... ends with '...'` | INFO | Chỉ khi `asr.force_language: true`, mỗi ngôn ngữ một lần: phần cuối prompt vLLM đã dựng. Ép đúng thì dòng `Vietnamese` kết thúc bằng `<\|im_start\|>assistant\nlanguage Vietnamese<asr_text>`, và phần trước đó giống dòng `auto` (nếu có). |
 | `commit call=... utterance=... reason=... words=... skipped_partials=N` | INFO | Đã phát một FINAL. `N` khác 0 nghĩa là utterance này đã bị bỏ N lần nhận dạng PARTIAL vì model chậm hơn audio. |
 | `asr backlog call=...: ... ms of audio waiting; PARTIAL inference is skipped ...` | WARNING | Model không theo kịp stream này; PARTIAL thưa đi. Ghi một lần cho mỗi stream. |
 | `asr error call=... consecutive=N: ...` | ERROR | Model lỗi; mất utterance đó, stream vẫn mở. |
@@ -390,16 +487,77 @@ Chỉ đổi cấu hình thì không cần `update.sh`: sửa `config/server.yam
 | `protocol error: ...` | WARNING | Client vi phạm hợp đồng; stream bị đóng. |
 | `chunk_seq gap ...: expected ..., got ...` | WARNING | rtpgw đã bỏ chunk vì hàng đợi gửi của nó đầy; phần audio đó mất, stream vẫn xử lý tiếp. Ghi 3 lần đầu của mỗi stream, sau đó mỗi 500 lần. |
 | `rtp_timestamp jump ... chunk_seq=...: expected ..., got ...` | WARNING | `rtp_timestamp` của chunk không nối tiếp audio đã nhận; từ chunk đó `ts_start`/`ts_end` tính theo giá trị mới. Ghi 3 lần đầu của mỗi stream, sau đó mỗi 500 lần. |
-| `model reported language ...` | WARNING | Model báo ngôn ngữ ngoài `vi`/`en`; `language` để rỗng. |
+| `model reported language ...` | WARNING | Model báo ngôn ngữ ngoài `vi`/`en`; `language` để rỗng. Chỉ xảy ra khi model tự đoán: `asr.force_language: false`, hoặc stream `auto`. |
 | `punctuation not ready after ... ms; using raw text` | WARNING | Punctuation quá hạn; kết quả dùng text chưa có dấu câu. |
+| `noise_reduction on: N denoisers loaded in ... s, ... worker threads, ... ms of audio per result, max_backlog_ms=...` | INFO | Lúc khởi động, khi bật khử nhiễu. |
+| `noise_reduction stream ended session=... stream=... outcome=... output=... chunks=... samples_in=... samples_out=... samples_sent=... clipped=... results=... first_audio_ms=... model_ms_p50=... model_ms_p95=... model_ms_max=... queue_ms_p95=... queue_ms_max=... backlog_ms_max=... chunk_seq_gaps=...` | INFO | Một stream khử nhiễu kết thúc. `outcome`: `final` (bình thường), `cancelled` (Gateway hủy, ví dụ khi chuyển sang audio gốc), `invalid`, `model_error`, `backlog` (audio chờ xử lý vượt `max_backlog_ms`), `read_error` (lỗi khi đọc luồng request, ví dụ server đang dừng hoặc message hỏng; Gateway mất kết nối thì ghi là `cancelled`). `backlog_ms_max`: lượng audio chờ model lớn nhất. `first_audio_ms` phải dưới 500. `model_ms`: thời gian model cho mỗi chunk 80 ms, phải nhỏ hơn 80 nhiều; `queue_ms` tăng là thiếu `workers`. `clipped` khác 0 là audio ra bị bão hòa. |
+| `noise_reduction refused session=... stream=...: all N denoisers in use (M streams refused since start)` | WARNING | Hết bộ lọc; stream bị từ chối, Gateway phát audio gốc. Ghi 3 lần đầu, sau đó mỗi 100 lần. Tăng `noise_reduction.max_streams` nếu CPU còn dư. |
+| `noise_reduction backlog session=... stream=...: N ms of audio waiting to be processed, above noise_reduction.max_backlog_ms ...; stream closed (M streams closed since start)` | WARNING | Audio chờ xử lý vượt ngưỡng; stream bị đóng, Gateway phát audio gốc. Ghi 3 lần đầu, sau đó mỗi 100 lần. Nếu `model_ms`, `queue_ms` của dòng tóm tắt cao thì CPU không theo kịp: giảm `max_streams` hoặc tăng `workers` nếu còn nhân CPU. Nếu chúng thấp thì nguyên nhân là Gateway gửi dồn hoặc đọc kết quả chậm. |
+| `noise_reduction model failed ...` / `denoiser reset failed ...` | ERROR | Model lỗi; stream đó kết thúc (`UNAVAILABLE`), bộ lọc được nạp lại. |
+| `asr_result call=... leg=... utterance=... revision=... event=... language=... han_chars=N model_output=... raw=... text=...` | INFO | Chỉ có khi `asr.log_results: true`. Mỗi PARTIAL và COMMIT server tạo ra một dòng, ghi trước bước hiện từng từ. Câu trả lời của model không đổi text thì không tạo kết quả nên không có dòng này. |
+
+Các trường của dòng `asr_result`:
+
+- `revision`: số thứ tự trong server. Khi bật hiện từng từ, số này khác `revision` mà client nhận.
+- `language`: ngôn ngữ server đang dùng cho câu đó.
+- `han_chars`: số chữ Hán trong `raw`.
+- `model_output`: câu trả lời gốc của model, còn nguyên marker ngôn ngữ. Trường này rỗng khi model lỗi, hoặc khi dùng `asr.backend: qwen_asr`.
+- `raw`, `text`: text trước và sau punctuation.
+
+Tìm các kết quả có chữ Hán, gồm cả các file log đã xoay vòng:
+
+```bash
+grep -h 'asr_result' logs/asr-server.log* | grep -v 'han_chars=0 '
+```
+
+**Kiểm tra ép ngôn ngữ** sau khi bật `asr.force_language: true` và khởi động lại (mục 7). `L` in log từ lần khởi động gần nhất. Nếu server khởi động từ trước nửa đêm, dòng `loading` đã sang file `logs/asr-server.log.<ngày>` nên `L` in cả file hôm nay.
+
+```bash
+cd /u01/ims/audio-engine
+grep -nE 'force_language|default_language|log_results' config/server.yaml
+N=$(grep -n 'loading Qwen3-ASR' logs/asr-server.log | tail -1 | cut -d: -f1)
+L() { tail -n +"${N:-1}" logs/asr-server.log; }
+
+# 1. Khởi động
+L | grep -E 'loading Qwen3-ASR|asr.force_language on|listening on'
+L | grep -E 'ERROR|Traceback' | head -20
+
+# 2. Prompt vLLM đã dựng (có sau cuộc gọi đầu tiên)
+L | grep 'model prompt language='
+
+# 3. Ngôn ngữ của các stream, và các lần model tự đoán
+L | grep 'start call=' | grep -o 'language=[A-Za-z]*' | sort | uniq -c
+L | grep -o "model reported language '[^']*'" | sort | uniq -c
+
+# 4. Kết quả nhận dạng (cần asr.log_results: true)
+L | grep 'asr_result' | grep -c "model_output='language "
+L | grep 'asr_result' | grep -o ' language=[^ ]*' | sort | uniq -c
+L | grep 'asr_result' | grep -v 'han_chars=0 ' | tail -20
+L | grep 'asr_result' | grep 'event=COMMIT' | tail -30
+
+# Theo dõi trực tiếp khi gọi thử (Ctrl+C để dừng)
+tail -f logs/asr-server.log | grep --line-buffered -E 'start call=|model prompt|model reported language|asr_result|ERROR'
+```
+
+| Bước | Kết quả đúng | Nếu khác |
+|---|---|---|
+| 1 | Có `asr.force_language on: ... default vi` (giá trị của `asr.default_language`), rồi `listening on ...`. Không có `ERROR`, `Traceback`. | Server không khởi động: đọc `logs/asr-server.out`. Thiếu chat template thì có `no chat template in ...`. |
+| 2 | Dòng `Vietnamese` kết thúc bằng `<\|im_start\|>assistant\nlanguage Vietnamese<asr_text>'`. | Đã có cuộc gọi mà không có dòng nào: vLLM không trả về prompt. Dùng bước 4 để kiểm tra. |
+| 3 | Các stream có `language=Vietnamese`. Lệnh thứ hai không in gì. | Còn `model reported language`: xem stream đó có phải `auto` không (dòng `start` ghi `language=auto`). |
+| 4 | Lệnh đầu in `0`. Chỉ có `language=Vietnamese`. Lệnh `han_chars` không in gì. | `model_output` còn bắt đầu bằng `language `: model vẫn tự chọn ngôn ngữ, ép không có tác dụng. Đặt lại `force_language: false`, khởi động lại, giữ log bước 2 và 4. |
+
+Dòng `asr_result` chứa nội dung cuộc gọi: che bớt trước khi gửi ra ngoài.
 
 ### 12.2. Sự cố
 
 | Hiện tượng | Nguyên nhân | Xử lý |
 |---|---|---|
-| `update.sh`: `the configuration in ... is not valid for this version` | Cấu hình trong APP có khóa lạ hoặc giá trị sai với mã mới | Sửa theo thông báo, so với `config/server.yaml.dist`, chạy lại `update.sh`. |
+| `update.sh`: `the configuration in ... is not valid for this version` | Cấu hình trong APP có khóa lạ hoặc giá trị sai với mã mới | Sửa theo thông báo, so với `config/server.yaml.dist.new`, chạy lại `update.sh`. |
 | `update.sh`: `asr_server is running in ...` | Server đang chạy | Thêm `--restart`, hoặc `bin/stop.sh` trước. |
 | `update.sh`: `Permission denied` | User không có quyền ghi vào APP | Chạy bằng user chạy app. |
+| `update.sh`: `the installed version cannot read ...` | Đã thêm khóa của phiên bản mới trước khi nâng cấp | Bỏ khóa đó, chạy lại `update.sh --restart`, rồi thêm lại khóa và khởi động lại. |
+| `update.sh`: `did not become ready; it was NOT rolled back` | Server chết hoặc chưa mở cổng sau `ASR_START_WAIT_SEC` giây | Xem `logs/asr-server.log` và `logs/asr-server.out`. Sửa lỗi rồi nâng cấp lại, hoặc chạy `bin/rollback.sh`. |
+| `rollback.sh`: `the saved configuration of ... is not valid` | Cấu hình trong bản lưu không hợp lệ với mã của bản đó | Chọn bản khác trong `bin/rollback.sh --list`. |
 | `configuration error: ...`, mã thoát 2 | Khóa lạ hoặc giá trị sai trong YAML | Sửa theo thông báo, chạy lại `--check-config`. |
 | `missing local ASR checkpoint` / `punctuation checkpoint` / `Silero VAD checkpoint` | Thiếu model hoặc sai đường dẫn | Kiểm tra `APP/model` và ba khóa đường dẫn model. |
 | `asr_server exited during startup; see .../logs/asr-server.out` | Lỗi khi khởi động | Đọc `logs/asr-server.out`; chạy lại ở tiền cảnh (mục 8.1). |

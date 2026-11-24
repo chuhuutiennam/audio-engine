@@ -22,7 +22,7 @@ TWO = ONE + ONE
 
 def chunks(frames, *, session='call-1', stream='call-1-a2b', rtp_start=0, clock=8000, seq_start=0,
            language='vi', task='speech_to_text', end=True, chunk_bytes=CHUNK, sample_rate=16000,
-           channels=1, language_source='', mutate=None):
+           channels=1, language_source='', output_audio_format=pb.LEGACY_ENCODED, mutate=None):
     """List of AudioChunk messages for `frames` (PCM16 bytes)."""
     data = b''.join(frames)
     ticks = (chunk_bytes // 2) * (clock or sample_rate) // sample_rate
@@ -34,7 +34,8 @@ def chunks(frames, *, session='call-1', stream='call-1-a2b', rtp_start=0, clock=
             channels=channels, rtp_timestamp=(rtp_start + n * ticks) % (1 << 32),
             duration_ms=len(piece) // 2 * 1000 // sample_rate, rtp_clock_rate=clock,
             chunk_seq=(-1 if seq_start is None else seq_start + n), language=language, task=task,
-            language_source=language_source, end_of_stream=(end and n == len(pieces) - 1))
+            language_source=language_source, output_audio_format=output_audio_format,
+            end_of_stream=(end and n == len(pieces) - 1))
         out.append(chunk)
     if mutate:
         mutate(out)
@@ -247,6 +248,23 @@ def test_position_on_a_jump_ends_on_the_old_timeline_and_starts_on_the_new_one()
     assert stream.ticks(80) == 1000 + 640 and stream.ticks(200) == 50000 + 320
 
 
+@pytest.mark.parametrize('clock', [8000, 16000], ids=['g722', 'l16'])
+def test_wideband_session_text_only_and_ts_on_the_session_clock(clock, caplog):
+    """What rtpgw sends with media.codec g722 | l16: 16 kHz PCM, output_audio_format (tag 14)
+    PCM_S16LE on every chunk, rtp_clock_rate 8000 for G.722 (RFC 3551 keeps the 8 kHz clock)
+    and 16000 for L16. speech_to_text ignores tag 14: the same text-only results as a G.711
+    session, with ts_start / ts_end on the session's RTP clock."""
+    g711 = recognise(chunks(SILENCE_VOICE_SILENCE))
+    with caplog.at_level(logging.WARNING, logger='qwen3_asr.grpc.vad'):
+        wide = recognise(chunks(SILENCE_VOICE_SILENCE, clock=clock, output_audio_format=pb.PCM_S16LE))
+    assert wide[-1].is_final and [r.text for r in wide] == [r.text for r in g711]
+    scale = clock // 8000                                   # ticks per ms: 8 (G.722), 16 (L16)
+    assert [(r.ts_start, r.ts_end) for r in wide] == [(r.ts_start * scale, r.ts_end * scale) for r in g711]
+    for r in wide:
+        assert (r.audio_payload, r.audio_format, r.audio_sample_rate) == (b'', pb.LEGACY_ENCODED, 0)
+    assert not [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_timestamps_that_never_continue_are_logged_sparingly_and_bounded(caplog):
     """A sender whose rtp_timestamp is off on every chunk: no log flood, bounded memory."""
     def drift(messages):
@@ -364,6 +382,7 @@ def test_language_source_only_when_enabled():
     (dict(task='realtime_translation'), grpc.StatusCode.UNIMPLEMENTED),
     (dict(task='keyword'), grpc.StatusCode.UNIMPLEMENTED),
     (dict(task='voice_controller_emoji'), grpc.StatusCode.UNIMPLEMENTED),
+    (dict(task='noise_reduction'), grpc.StatusCode.UNIMPLEMENTED),   # gateway task, not served here yet
     (dict(task='something_else'), grpc.StatusCode.INVALID_ARGUMENT),
     (dict(task='summarise'), grpc.StatusCode.INVALID_ARGUMENT),
     (dict(session=''), grpc.StatusCode.INVALID_ARGUMENT),

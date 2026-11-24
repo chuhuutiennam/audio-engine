@@ -30,7 +30,17 @@ NEW_DEFAULTS = dict(ingress_max_ms=3000, audio_timeout_ms=2000, asr_max_consecut
                     punct_workers=1, punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000,
                     # backend selection; vad_mode only applies to vad.backend = webrtc
                     asr_backend='native_vllm', vad_backend='silero', vad_workers=2, vad_mode=2,
-                    use_language_source=False)
+                    use_language_source=False,
+                    # language of a stream that names none (was fixed to Vietnamese); not forced
+                    default_language='vi', force_language=False,
+                    # the text of the calls stays out of the log unless asked for
+                    asr_log_results=False,
+                    # word-by-word reveal of PARTIAL results, off by default
+                    word_reveal_enabled=False, word_reveal_window_ms=400, word_reveal_min_interval_ms=120,
+                    # task noise_reduction (DPDFNet-2), off by default; speech_to_text stays on
+                    asr_enabled=True, noise_enabled=False, noise_model='/opt/models/dpdfnet2.onnx',
+                    noise_frame_ms=20, noise_num_threads=1, noise_workers=2, noise_max_streams=16,
+                    noise_max_backlog_ms=500)
 ALL_DEFAULTS = {**FORMER_CLI_DEFAULTS, **NEW_DEFAULTS}
 
 
@@ -44,6 +54,52 @@ def test_shipped_server_yaml_equals_defaults():
 
 def test_empty_file_gives_defaults(tmp_path):
     assert load_settings(write(tmp_path, '')) == Settings()
+
+
+def test_env_example_sets_the_offline_runtime_variables():
+    lines = (ROOT / 'bin' / 'env.sh.example').read_text(encoding='utf-8').splitlines()
+    exported = dict(line[len('export '):].split('=', 1) for line in lines if line.startswith('export '))
+    assert exported == {
+        'PIP_NO_INDEX': '1', 'PIP_DISABLE_PIP_VERSION_CHECK': '1', 'HF_HUB_OFFLINE': '1',
+        'TRANSFORMERS_OFFLINE': '1', 'HF_DATASETS_OFFLINE': '1', 'HF_HUB_DISABLE_TELEMETRY': '1',
+        'TOKENIZERS_PARALLELISM': 'false', 'VLLM_WORKER_MULTIPROC_METHOD': 'spawn',
+        'CUDA_VISIBLE_DEVICES': '0'}
+
+
+def test_word_reveal_is_off_unless_enabled(tmp_path):
+    assert Settings().word_reveal is None
+    path = write(tmp_path, 'asr:\n  chunk_sec: 0.5\nword_reveal:\n  enabled: true\n')
+    assert load_settings(path).word_reveal == (400, 120)
+    path = write(tmp_path, 'word_reveal:\n  enabled: true\n  window_ms: 300\n  min_interval_ms: 100\n')
+    assert load_settings(path).word_reveal == (300, 100)
+
+
+def test_log_results_is_read_from_the_asr_section(tmp_path):
+    assert load_settings(write(tmp_path, 'asr:\n  log_results: true\n')).asr_log_results is True
+
+
+@pytest.mark.parametrize('code', ['vi', 'en', 'auto'])
+def test_language_settings_are_read_from_the_asr_section(tmp_path, code):
+    s = load_settings(write(tmp_path, f'asr:\n  default_language: {code}\n  force_language: true\n'))
+    assert (s.default_language, s.force_language) == (code, True)
+
+
+def test_noise_reduction_is_read_from_its_section(tmp_path):
+    s = load_settings(write(tmp_path, (
+        'asr:\n  enabled: false\n'
+        'noise_reduction:\n  enabled: true\n  model: /m/dpdfnet2.onnx\n  frame_ms: 40\n'
+        '  num_threads: 2\n  workers: 4\n  max_streams: 8\n  max_backlog_ms: 0\n')))
+    assert (s.asr_enabled, s.noise_enabled, s.noise_model, s.noise_frame_ms, s.noise_num_threads,
+            s.noise_workers, s.noise_max_streams, s.noise_max_backlog_ms) == \
+        (False, True, '/m/dpdfnet2.onnx', 40, 2, 4, 8, 0)
+
+
+def test_noise_reduction_limits_apply_only_when_enabled(tmp_path):
+    # default noise_reduction.max_streams (16) above server.max_streams is fine while it is off
+    assert load_settings(write(tmp_path, 'server:\n  max_streams: 8\n')).max_streams == 8
+    s = load_settings(write(tmp_path, 'server:\n  max_streams: 8\nnoise_reduction:\n  enabled: true\n'
+                                      '  max_streams: 8\n'))
+    assert (s.noise_enabled, s.noise_max_streams) == (True, 8)
 
 
 def test_values_and_overrides(tmp_path):
@@ -71,8 +127,35 @@ def test_values_and_overrides(tmp_path):
     'asr:\n  backend: whisper\n',
     'vad:\n  backend: energy\n',
     'asr:\n  dtype: float64\n',
+    'asr:\n  log_results: 1\n',
+    'asr:\n  default_language: fr\n',         # vi | en | auto only
+    'asr:\n  default_language: Vietnamese\n', # the speech.proto code, not the model name
+    'asr:\n  default_language: VI\n',
+    'asr:\n  default_language: ""\n',
+    'asr:\n  force_language: 1\n',
     'vad:\n  threshold: 1.5\n',
     'vad:\n  threshold: 0.5\n  neg_threshold: 0.7\n',
+    'word_reveal:\n  enabled: 1\n',
+    'word_reveal:\n  window_ms: 0\n',
+    'word_reveal:\n  min_interval_ms: 0\n',
+    'word_reveal:\n  window_ms: 100\n  min_interval_ms: 200\n',
+    'word_reveal:\n  windows_ms: 400\n',
+    # the words of one PARTIAL must be out before the next PARTIAL arrives
+    'asr:\n  chunk_sec: 0.5\nword_reveal:\n  enabled: true\n  window_ms: 600\n',
+    'asr:\n  enabled: 1\n',
+    'asr:\n  enabled: false\n',                # no task left to serve
+    'noise_reduction:\n  enabled: 1\n',
+    'noise_reduction:\n  model: ""\n',
+    'noise_reduction:\n  frame_ms: 10\n',      # the gateway wants multiples of 640 bytes (20 ms)
+    'noise_reduction:\n  frame_ms: 30\n',
+    'noise_reduction:\n  num_threads: 0\n',
+    'noise_reduction:\n  workers: 0\n',
+    'noise_reduction:\n  max_streams: 0\n',
+    'noise_reduction:\n  max_stream: 4\n',
+    'noise_reduction:\n  max_backlog_ms: -1\n',
+    'noise_reduction:\n  max_backlog_ms: 5001\n',
+    # gRPC would refuse the extra RPCs before the denoiser pool does
+    'server:\n  max_streams: 8\nnoise_reduction:\n  enabled: true\n',
     '- not\n- a mapping\n',
 ])
 def test_invalid_config_is_rejected(tmp_path, text):
@@ -134,6 +217,15 @@ def test_no_console_drops_only_console_handler(tmp_path, monkeypatch):
                 handler.close()
         root.handlers[:] = saved[0]
         root.setLevel(saved[1])
+
+
+def test_optional_setting_does_not_depend_on_the_typing_cache(tmp_path):
+    # Imports can push Optional[float] out of typing's cache; an identity check then failed
+    # with "vad_neg_threshold: expected a non-empty string, got 0.3".
+    import typing
+    for clear in typing._cleanups:
+        clear()
+    assert load_settings(write(tmp_path, 'vad:\n  neg_threshold: 0.3\n')).vad_neg_threshold == 0.3
 
 
 def test_backend_selection_and_optional_neg_threshold(tmp_path):

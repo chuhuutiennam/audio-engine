@@ -15,6 +15,8 @@ PCM_S16LE = 3     # little-endian mono signed PCM, 8 or 16 kHz
 PARTIAL = 1       # replace the current uncommitted utterance text
 COMMIT = 2        # immutable final utterance text
 
+AUTO_LANGUAGE = 'auto'    # StreamConfig.language: the model detects the language
+
 
 @dataclass
 class StreamConfig:
@@ -22,7 +24,7 @@ class StreamConfig:
     leg_id: str = ''
     encoding: int = 0
     sample_rate: int = 0
-    language: str = ''        # model language name ('Vietnamese'); '' = server default
+    language: str = ''        # model language name ('Vietnamese'), AUTO_LANGUAGE; '' = server default
 
 
 @dataclass

@@ -10,6 +10,8 @@ server:
   audio_timeout_ms: 2000     # open utterance and no audio for this long -> commit. 0 = disabled
 
 asr:
+  enabled: true              # task speech_to_text. false: Qwen3-ASR, VAD and punctuation are not
+                             # loaded (no GPU needed) and speech_to_text ends with UNIMPLEMENTED
   backend: native_vllm       # native_vllm: vllm.LLM.chat(), language auto-detected
                              # qwen_asr:    qwen_asr package streaming state
   model: /opt/models/Qwen3-ASR-1.7B
@@ -26,6 +28,13 @@ asr:
                              # inference and keep the audio for the next one. A FINAL is always
                              # inferred. 0 = never skip (use it for --fast throughput measurements)
   use_language_source: false # true: AudioChunk.language_source overrides AudioChunk.language
+  log_results: false         # true: one INFO line per PARTIAL and COMMIT with the language, the model
+                             # answer and the text. The log then holds the content of the calls
+  default_language: vi       # vi | en | auto: language of a stream whose AudioChunk.language is empty
+                             # or unknown. auto = the model detects it
+  force_language: false      # native_vllm. true: the model transcribes the language of the stream
+                             # (vi, en) instead of detecting it; auto is still detected. Needs the
+                             # chat template in the model directory
 
 vad:
   backend: silero            # silero | webrtc
@@ -50,3 +59,22 @@ semantic:
   early_commit: false        # optional early commit on a confident terminal mark
   confidence: 0.90
   stable_updates: 2
+
+word_reveal:
+  enabled: false             # true: the text of a PARTIAL grows word by word
+  window_ms: 400             # new words are shown within this time; not longer than asr.chunk_sec
+  min_interval_ms: 120       # minimum time between two results sent on a stream
+
+noise_reduction:             # task noise_reduction: DPDFNet-2 on CPU, audio back for every chunk
+  enabled: false             # false: noise_reduction ends with UNIMPLEMENTED (the gateway plays the
+                             # original audio). true needs sherpa-onnx and the model file
+  model: /opt/models/dpdfnet2.onnx   # local file, never downloaded by the server
+  frame_ms: 20               # audio per result: 20 | 40 | 80
+  num_threads: 1             # ONNX threads of each denoiser
+  workers: 2                 # threads that run the denoisers of all streams
+  max_streams: 16            # denoisers loaded at start (~20 MB each); one more stream ->
+                             # RESOURCE_EXHAUSTED. Not above server.max_streams. Choose it from a
+                             # measurement on the target CPU, not from the number of calls
+  max_backlog_ms: 500        # more audio than this waiting for the model (the CPU does not keep up):
+                             # the stream ends with RESOURCE_EXHAUSTED and the gateway plays the
+                             # original audio for the rest of the call. 0 = no limit, at most 5000

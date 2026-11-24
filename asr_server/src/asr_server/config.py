@@ -15,6 +15,9 @@ import yaml
 
 @dataclass(frozen=True)
 class Settings:
+    # tasks served (AudioChunk.task); a task that is off ends with UNIMPLEMENTED
+    asr_enabled: bool = True                  # speech_to_text: loads Qwen3-ASR, VAD and punctuation
+    noise_enabled: bool = False               # noise_reduction: DPDFNet-2 (sherpa-onnx, CPU)
     # server
     host: str = '0.0.0.0'
     port: int = 50051
@@ -35,6 +38,9 @@ class Settings:
     asr_max_consecutive_errors: int = 3
     partial_max_backlog_ms: int = 500         # 0 = never skip a PARTIAL inference
     use_language_source: bool = False         # read AudioChunk.language_source
+    asr_log_results: bool = False             # log language and text of every PARTIAL and COMMIT
+    default_language: str = 'vi'              # vi | en | auto: stream that names no language
+    force_language: bool = False              # native_vllm: transcribe the stream's language
     # vad
     vad_backend: str = 'silero'               # silero | webrtc
     silero_model: str = '/opt/models/silero_vad.jit'
@@ -56,6 +62,24 @@ class Settings:
     semantic_early_commit: bool = False
     semantic_confidence: float = 0.90
     stable_updates: int = 2
+    # word-by-word reveal of PARTIAL results
+    word_reveal_enabled: bool = False
+    word_reveal_window_ms: int = 400
+    word_reveal_min_interval_ms: int = 120
+    # noise_reduction (docs/DPDFNet2_Task_Routing_Design_VI.md, section 7.2)
+    noise_model: str = '/opt/models/dpdfnet2.onnx'
+    noise_frame_ms: int = 20                  # audio per result: 20 | 40 | 80
+    noise_num_threads: int = 1                # ONNX threads of each denoiser
+    noise_workers: int = 2                    # threads that run the denoisers of all streams
+    noise_max_streams: int = 16               # denoisers loaded at start; one per stream
+    noise_max_backlog_ms: int = 500           # audio waiting for the model; above it the stream ends
+
+    @property
+    def word_reveal(self):
+        """(window_ms, min_interval_ms) when the word-by-word reveal is on, else None."""
+        if not self.word_reveal_enabled:
+            return None
+        return self.word_reveal_window_ms, self.word_reveal_min_interval_ms
 
 
 # (yaml section, yaml key) -> Settings field
@@ -65,6 +89,7 @@ _KEYS = {
     ('server', 'max_streams'): 'max_streams',
     ('server', 'ingress_max_ms'): 'ingress_max_ms',
     ('server', 'audio_timeout_ms'): 'audio_timeout_ms',
+    ('asr', 'enabled'): 'asr_enabled',
     ('asr', 'backend'): 'asr_backend',
     ('asr', 'model'): 'model',
     ('asr', 'chunk_sec'): 'chunk_sec',
@@ -78,6 +103,9 @@ _KEYS = {
     ('asr', 'max_consecutive_errors'): 'asr_max_consecutive_errors',
     ('asr', 'partial_max_backlog_ms'): 'partial_max_backlog_ms',
     ('asr', 'use_language_source'): 'use_language_source',
+    ('asr', 'log_results'): 'asr_log_results',
+    ('asr', 'default_language'): 'default_language',
+    ('asr', 'force_language'): 'force_language',
     ('vad', 'backend'): 'vad_backend',
     ('vad', 'silero_model'): 'silero_model',
     ('vad', 'threshold'): 'vad_threshold',
@@ -96,6 +124,16 @@ _KEYS = {
     ('semantic', 'early_commit'): 'semantic_early_commit',
     ('semantic', 'confidence'): 'semantic_confidence',
     ('semantic', 'stable_updates'): 'stable_updates',
+    ('word_reveal', 'enabled'): 'word_reveal_enabled',
+    ('word_reveal', 'window_ms'): 'word_reveal_window_ms',
+    ('word_reveal', 'min_interval_ms'): 'word_reveal_min_interval_ms',
+    ('noise_reduction', 'enabled'): 'noise_enabled',
+    ('noise_reduction', 'model'): 'noise_model',
+    ('noise_reduction', 'frame_ms'): 'noise_frame_ms',
+    ('noise_reduction', 'num_threads'): 'noise_num_threads',
+    ('noise_reduction', 'workers'): 'noise_workers',
+    ('noise_reduction', 'max_streams'): 'noise_max_streams',
+    ('noise_reduction', 'max_backlog_ms'): 'noise_max_backlog_ms',
 }
 _SECTIONS = sorted({section for section, _ in _KEYS})
 _TYPES = {f.name: f.type for f in fields(Settings)}
@@ -107,7 +145,8 @@ class ConfigError(ValueError):
 
 def _coerce(name, value):
     kind = _TYPES[name]
-    if kind is Optional[float]:
+    # ==, not `is`: Optional[float] is a new object once typing's cache has dropped it.
+    if kind == Optional[float]:
         if value is None:
             return None
         kind = float
@@ -141,6 +180,9 @@ def _validate(s: Settings):
         raise ConfigError("vad.backend must be 'silero' or 'webrtc'")
     if s.dtype not in ('auto', 'float16', 'bfloat16'):
         raise ConfigError("asr.dtype must be 'auto', 'float16' or 'bfloat16'")
+    # speech_service.LANGUAGE_NAMES and AUTO_CODE; not imported, so that config needs no gRPC
+    if s.default_language not in ('vi', 'en', 'auto'):
+        raise ConfigError("asr.default_language must be 'vi', 'en' or 'auto'")
     if s.max_model_len < 1 or s.max_num_seqs < 1 or s.vad_workers < 1:
         raise ConfigError('asr.max_model_len, asr.max_num_seqs and vad.workers must be >= 1')
     if not 0.0 < s.vad_threshold < 1.0:
@@ -160,6 +202,21 @@ def _validate(s: Settings):
         raise ConfigError('asr.max_consecutive_errors and punctuation.workers must be >= 1')
     if s.punct_partial_timeout_ms < 1 or s.punct_commit_timeout_ms < 1:
         raise ConfigError('punctuation timeouts must be >= 1 ms')
+    if not 1 <= s.word_reveal_min_interval_ms <= s.word_reveal_window_ms:
+        raise ConfigError('require 1 <= word_reveal.min_interval_ms <= word_reveal.window_ms')
+    if s.word_reveal_enabled and s.word_reveal_window_ms > s.chunk_sec * 1000:
+        raise ConfigError('word_reveal.window_ms must not be longer than asr.chunk_sec')
+    if not (s.asr_enabled or s.noise_enabled):
+        raise ConfigError('asr.enabled and noise_reduction.enabled are both false: no task to serve')
+    # The gateway packetizes multiples of 640 bytes (20 ms of PCM16 at 16 kHz).
+    if s.noise_frame_ms not in (20, 40, 80):
+        raise ConfigError('noise_reduction.frame_ms must be 20, 40 or 80')
+    if s.noise_num_threads < 1 or s.noise_workers < 1 or s.noise_max_streams < 1:
+        raise ConfigError('noise_reduction.num_threads, workers and max_streams must be >= 1')
+    if not 0 <= s.noise_max_backlog_ms <= 5000:
+        raise ConfigError('noise_reduction.max_backlog_ms must be between 0 (off) and 5000')
+    if s.noise_enabled and s.noise_max_streams > s.max_streams:
+        raise ConfigError('noise_reduction.max_streams must not be above server.max_streams')
 
 
 def load_settings(path, overrides=None) -> Settings:

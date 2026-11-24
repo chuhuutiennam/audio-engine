@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import inspect
 import logging
 import os
+import time
 
 import grpc
 import numpy as np
@@ -33,7 +34,7 @@ import numpy as np
 from . import messages as pb
 from .audio import PCM16kConverter, decode_audio
 from .punctuation import HFPunctuator, IdentityPunctuator, PunctResult
-from .text_clean import strip_asr_markers
+from .text_clean import count_han, strip_asr_markers
 from .vad import SileroEndpointer, WebRTCEndpointer
 
 LOG = logging.getLogger('qwen3_asr.grpc.vad')
@@ -94,9 +95,14 @@ class ASRService:
                  ingress_max_ms=3000, audio_timeout_ms=2000,
                  partial_max_backlog_ms=500,
                  max_consecutive_errors=3, punct_workers=1,
-                 punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000):
+                 punct_partial_timeout_ms=300, punct_commit_timeout_ms=1000,
+                 log_results=False, default_language='Vietnamese'):
+        """`default_language`: model language name or pb.AUTO_LANGUAGE, for a stream that names none."""
         if not 0.2 <= chunk_sec < max_utterance_sec:
             raise ValueError('require 0.2 <= chunk_sec < max_utterance_sec')
+        if not default_language:
+            raise ValueError('default_language must be a language name or auto')
+        self.default_language = default_language
         self.asr = model
         self.punctuator = punctuator
         # Punctuators written before the language argument existed keep working.
@@ -126,6 +132,7 @@ class ASRService:
         self.max_consecutive_errors = int(max_consecutive_errors)
         self.punct_partial_timeout_ms = int(punct_partial_timeout_ms)
         self.punct_commit_timeout_ms = int(punct_commit_timeout_ms)
+        self.log_results = bool(log_results)
         self.infer_worker = InferWorker()
         self.punct_pool = ThreadPoolExecutor(max_workers=max(1, int(punct_workers)),
                                              thread_name_prefix='punct')
@@ -218,7 +225,7 @@ class ASRService:
             skipped_partials = 0
             deferred_chunks = 0
             asr_state = self.asr.init_streaming_state(
-                language=cfg.language or 'Vietnamese',
+                language=stream_language(),
                 unfixed_chunk_num=2, unfixed_token_num=5,
                 chunk_size_sec=self.chunk_sec)
             converter = PCM16kConverter(cfg.sample_rate)
@@ -233,12 +240,26 @@ class ASRService:
             stable_count = 0
             partial_sent = False
 
-        def utterance_language():
-            """Language of the open utterance: what the model reports, else what the client asked for."""
-            return (asr_state.language if asr_state is not None else '') or cfg.language or ''
+        def stream_language():
+            """Language name the client asked for, else the server default; None = the model detects it."""
+            language = cfg.language or self.default_language
+            return None if language == pb.AUTO_LANGUAGE else language
 
-        def make_event(kind, text, raw_text, reason, end_ms):
+        def utterance_language():
+            """Language of the open utterance: what the model reports, else what the stream asked for."""
+            return (asr_state.language if asr_state is not None else '') or stream_language() or ''
+
+        def make_event(kind, text, raw_text, reason, end_ms, answered=True):
+            """`answered` is False when the model failed: its last answer says nothing about this event."""
             language = utterance_language()
+            if self.log_results:
+                # %r keeps a line break of the model on one log line.
+                LOG.info('asr_result call=%s leg=%s utterance=%s revision=%s event=%s language=%s '
+                         'han_chars=%d model_output=%r raw=%r text=%r',
+                         cfg.call_id, cfg.leg_id, utterance_index, revision,
+                         'COMMIT' if kind == pb.COMMIT else 'PARTIAL', language,
+                         count_han(raw_text),
+                         getattr(asr_state, 'raw_output', '') if answered else '', raw_text, text)
             return pb.Transcript(
                 call_id=cfg.call_id, leg_id=cfg.leg_id,
                 utterance_index=utterance_index, text=text,
@@ -249,12 +270,12 @@ class ASRService:
                 start_ms=max(0, current_start_ms), end_ms=max(0, int(end_ms)),
             )
 
-        def clear_partial(end_ms):
+        def clear_partial(end_ms, answered=True):
             """Empty PARTIAL: tells the client to drop the text shown for this utterance."""
             nonlocal revision, partial_sent
             revision += 1
             partial_sent = False
-            return make_event(pb.PARTIAL, '', '', 'partial', end_ms)
+            return make_event(pb.PARTIAL, '', '', 'partial', end_ms, answered)
 
         async def infer(fn, *args):
             """Run a model call on the inference worker; AsrFailure if the model raised."""
@@ -378,7 +399,7 @@ class ASRService:
             nonlocal asr_state, skip_until_endpoint
             LOG.error('asr error call=%s leg=%s utterance=%s consecutive=%d: %s',
                       cfg.call_id, cfg.leg_id, utterance_index, consecutive_errors, exc)
-            out = [clear_partial(end_ms)] if partial_sent else []
+            out = [clear_partial(end_ms, answered=False)] if partial_sent else []
             asr_state = None
             skip_until_endpoint = bool(vad.active)
             if consecutive_errors >= self.max_consecutive_errors:
@@ -522,8 +543,9 @@ class ASRService:
                         vad = await loop.run_in_executor(self.vad_pool, self.build_vad,
                                                          cfg.sample_rate)
                     vad_offload = bool(getattr(vad, 'offload', False))
-                    LOG.info('start call=%s leg=%s rate=%d codec=%d',
-                             cfg.call_id, cfg.leg_id, cfg.sample_rate, cfg.encoding)
+                    LOG.info('start call=%s leg=%s rate=%d codec=%d language=%s',
+                             cfg.call_id, cfg.leg_id, cfg.sample_rate, cfg.encoding,
+                             stream_language() or pb.AUTO_LANGUAGE)
                     continue
 
                 if what == 'audio':
@@ -573,12 +595,8 @@ class ASRService:
                 get_task.cancel()
 
 
-async def serve(args):
-    """Load models and serve until terminated. `args` is asr_server.config.Settings."""
-    os.environ['HF_HUB_OFFLINE'] = '1'
-    os.environ['TRANSFORMERS_OFFLINE'] = '1'
-    os.environ['HF_DATASETS_OFFLINE'] = '1'
-    os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+def _build_asr(args):
+    """asr.enabled: check and load Qwen3-ASR, VAD and punctuation; returns the speech_to_text core."""
     if not os.path.isdir(args.model):
         raise FileNotFoundError(f'missing local ASR checkpoint: {args.model}')
     if not os.path.isdir(args.punct_model):
@@ -608,7 +626,11 @@ async def serve(args):
             max_model_len=args.max_model_len,
             max_num_seqs=args.max_num_seqs,
             dtype=args.dtype,
-            enforce_eager=args.enforce_eager)
+            enforce_eager=args.enforce_eager,
+            force_language=args.force_language)
+        if args.force_language:
+            LOG.info('asr.force_language on: the model transcribes the language of the stream; '
+                     'default %s', args.default_language)
     else:
         from qwen_asr import Qwen3ASRModel
         LOG.info('loading Qwen3-ASR via qwen_asr streaming: %s', args.model)
@@ -619,6 +641,11 @@ async def serve(args):
     LOG.info('loading punctuation model: %s', args.punct_model)
     punctuator = HFPunctuator(args.punct_model, device=args.punct_device,
                               threshold=args.punct_threshold)
+    if args.asr_log_results:
+        LOG.warning('asr.log_results is on: the text of every call is written to the log')
+    from .speech_service import AUTO_CODE, LANGUAGE_NAMES
+    default_language = (pb.AUTO_LANGUAGE if args.default_language == AUTO_CODE
+                        else LANGUAGE_NAMES[args.default_language])
     service = ASRService(
         asr, punctuator, chunk_sec=args.chunk_sec,
         max_utterance_sec=args.max_utterance_sec,
@@ -636,23 +663,72 @@ async def serve(args):
         max_consecutive_errors=args.asr_max_consecutive_errors,
         punct_workers=args.punct_workers,
         punct_partial_timeout_ms=args.punct_partial_timeout_ms,
-        punct_commit_timeout_ms=args.punct_commit_timeout_ms)
-    server = grpc.aio.server(
-        maximum_concurrent_rpcs=args.max_streams,
-        options=[('grpc.max_receive_message_length', 2 * 1024 * 1024),
-                 ('grpc.keepalive_time_ms', 30000),
-                 ('grpc.keepalive_timeout_ms', 10000)])
-    from .proto import speech_pb2_grpc
-    from .speech_service import SpeechStreamService
-    speech_pb2_grpc.add_SpeechStreamServicer_to_server(
-        SpeechStreamService(service, use_language_source=args.use_language_source), server)
-    addr = f'{args.host}:{args.port}'
-    if server.add_insecure_port(addr) == 0:
-        raise RuntimeError(f'failed to bind {addr}')
-    await server.start()
-    LOG.info('listening on %s; plaintext for lab only', addr)
+        punct_commit_timeout_ms=args.punct_commit_timeout_ms,
+        log_results=args.asr_log_results,
+        default_language=default_language)
+    if args.word_reveal:
+        LOG.info('word-by-word reveal on: window=%d ms, min_interval=%d ms', *args.word_reveal)
+    return service
+
+
+def _build_noise(args):
+    """noise_reduction.enabled: load every DPDFNet-2 denoiser; returns the noise_reduction service."""
+    from . import denoise
+    from .noise_service import NoiseReductionService
+    LOG.info('loading %d DPDFNet-2 denoisers (%d ONNX threads each) from %s',
+             args.noise_max_streams, args.noise_num_threads, args.noise_model)
+    started = time.monotonic()
     try:
-        await server.wait_for_termination()
+        pool = denoise.DenoiserPool(denoise.dpdfnet2_factory(args.noise_model, args.noise_num_threads),
+                                    args.noise_max_streams)
+    except Exception as exc:
+        # In the log file too: bin/start.sh sends the traceback to logs/asr-server.out only.
+        LOG.error('noise_reduction cannot start: %s: %s', type(exc).__name__, exc)
+        raise
+    LOG.info('noise_reduction on: %d denoisers loaded in %.1f s, %d worker threads, %d ms of audio '
+             'per result, max_backlog_ms=%d', pool.size, time.monotonic() - started,
+             args.noise_workers, args.noise_frame_ms, args.noise_max_backlog_ms)
+    return NoiseReductionService(pool, frame_ms=args.noise_frame_ms, workers=args.noise_workers,
+                                 max_backlog_ms=args.noise_max_backlog_ms)
+
+
+async def serve(args):
+    """Load models and serve until terminated. `args` is asr_server.config.Settings."""
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    os.environ['HF_DATASETS_OFFLINE'] = '1'
+    os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+    # The denoisers first: CPU only, and a missing model stops the start before ASR takes GPU memory.
+    noise = _build_noise(args) if args.noise_enabled else None
+    service = None
+    try:
+        if args.asr_enabled:
+            service = _build_asr(args)
+        else:
+            LOG.info('asr.enabled is false: speech_to_text is off, no ASR, VAD or punctuation model loaded')
+        server = grpc.aio.server(
+            maximum_concurrent_rpcs=args.max_streams,
+            options=[('grpc.max_receive_message_length', 2 * 1024 * 1024),
+                     ('grpc.keepalive_time_ms', 30000),
+                     ('grpc.keepalive_timeout_ms', 10000)])
+        from .proto import speech_pb2_grpc
+        from .speech_service import SpeechStreamService
+        speech_pb2_grpc.add_SpeechStreamServicer_to_server(
+            SpeechStreamService(service, use_language_source=args.use_language_source,
+                                word_reveal=args.word_reveal, noise=noise), server)
+        addr = f'{args.host}:{args.port}'
+        if server.add_insecure_port(addr) == 0:
+            raise RuntimeError(f'failed to bind {addr}')
+        await server.start()
+        LOG.info('listening on %s; plaintext for lab only', addr)
+        try:
+            await server.wait_for_termination()
+        finally:
+            await server.stop(grace=5)
     finally:
-        await server.stop(grace=5)
-        service.close()
+        try:
+            if service is not None:
+                service.close()
+        finally:
+            if noise is not None:
+                noise.close()           # after server.stop(): no RPC uses it any more

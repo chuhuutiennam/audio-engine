@@ -15,3 +15,5 @@ PyYAML>=6
 # Only for the alternative backends, not needed by default:
 #   vad.backend: webrtc   ->  webrtcvad-wheels>=2.0.14
 #   asr.backend: qwen_asr ->  qwen-asr[vllm]
+# Only for task noise_reduction (noise_reduction.enabled: true), CPU:
+#   sherpa-onnx==2.0.2 (tested version: OnlineSpeechDenoiser, DPDFNet-2 model dpdfnet2.onnx)

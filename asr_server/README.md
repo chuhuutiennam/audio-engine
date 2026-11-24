@@ -17,7 +17,8 @@ asr_server/
 │                             run_tests.sh, client.py (demo client, speech.proto)
 ├── src/asr_server/           speech_service.py (gRPC, speech.proto), server.py (recognition core),
 │                             messages.py, asr_backend.py, vad.py, audio.py, punctuation.py,
-│                             text_clean.py, config.py, proto/ (speech.proto + bindings)
+│                             text_clean.py, config.py, proto/ (speech.proto + bindings),
+│                             noise_service.py + denoise.py (task noise_reduction, DPDFNet-2)
 ├── tests/                    server and deployment-script tests (no GPU or checkpoints needed)
 ├── tools/eval/               WER / VRAM evaluation client (eval_wav_grpc.py)
 ├── data/                     sample audio and ground truth for evaluation (not tracked)
@@ -34,8 +35,15 @@ Backends are chosen in `config/server.yaml`:
 
 | Key | Default | Alternative |
 |---|---|---|
-| `asr.backend` | `native_vllm`: `vllm.LLM.chat()` on the audio accumulated for the utterance; language auto-detected | `qwen_asr`: streaming state of the `qwen_asr` package (needs `qwen-asr[vllm]`) |
+| `asr.backend` | `native_vllm`: `vllm.LLM.chat()` on the audio accumulated for the utterance; language auto-detected unless `asr.force_language` | `qwen_asr`: streaming state of the `qwen_asr` package (needs `qwen-asr[vllm]`) |
 | `vad.backend` | `silero`: Silero TorchScript on CPU, 32 ms frames | `webrtc`: WebRTC VAD, 20 ms frames (needs `webrtcvad-wheels`) |
+
+Tasks (`AudioChunk.task`) are switched on in the same file; at least one must be on:
+
+| Key | Default | Effect |
+|---|---|---|
+| `asr.enabled` | `true` | `speech_to_text`. `false`: Qwen3-ASR, VAD and punctuation are not loaded (no GPU needed) and `speech_to_text` ends with `UNIMPLEMENTED`. |
+| `noise_reduction.enabled` | `false` | `noise_reduction` with DPDFNet-2 on CPU, see [Task `noise_reduction`](#task-noise_reduction-dpdfnet-2). Needs `sherpa-onnx==2.0.2` and the model file. `false`: `UNIMPLEMENTED`. |
 
 The rest of this document describes the defaults.
 
@@ -57,11 +65,27 @@ more GPU work as utterances get longer. Max utterance is bounded to 15s by
 default. Audio data URIs require no
 network and are created in RAM, not on disk.
 
-Language: native vLLM chat auto-detects the spoken language. The model answers
-`language Vietnamese<asr_text>...`; the server removes the marker and uses the
-language it names as `Transcript.language` and as the language given to
-punctuation. The language sent by the client is only the value reported until
-the model has named one. It is not forced on the model.
+Language: by default native vLLM chat auto-detects the spoken language. The model
+answers `language Vietnamese<asr_text>...`; the server removes the marker and uses
+the language it names as `Transcript.language` and as the language given to
+punctuation. The language of the stream (`AudioChunk.language`, else
+`asr.default_language`) is then only the value reported until the model has named one.
+
+With `asr.force_language: true`, the language of the stream is forced on the model
+instead: the server appends `language Vietnamese<asr_text>` (or `English`) to the
+generation prompt of the model's chat template, as the `qwen_asr` package does for a
+forced language, and passes that template to `LLM.chat(chat_template=...)`. The model
+then writes the text only and the result keeps the forced language. A stream whose
+language is `auto` is still detected. The template is read from the model directory
+(`chat_template.jinja`, `chat_template.json` or `tokenizer_config.json`); without one
+the server does not start. Once per language, `model prompt language=... ends with
+'...'` logs the end of the prompt vLLM built. The `qwen_asr` backend always forces
+the language of the stream (except `auto`), whatever `asr.force_language` says.
+
+| Key | Default | Values |
+|---|---|---|
+| `asr.default_language` | `vi` | `vi`, `en` or `auto`: language of a stream whose `language` is empty or unknown. Replaces the former fixed `Vietnamese`. |
+| `asr.force_language` | `false` | `true`: force the language of the stream (native_vllm). |
 
 ## gRPC contract (`speech.proto`)
 
@@ -81,16 +105,17 @@ message: the first chunk fixes the stream.
 |---|---|
 | `session_id`, `stream_id` | Mandatory. Must not change within the RPC. |
 | `pcm` | Signed 16-bit little-endian mono. Length must be even. Normally 80 ms (2560 bytes at 16 kHz); other sizes are accepted. |
-| `sample_rate` | `16000` (or `8000`). Must not change. |
+| `sample_rate` | `16000` (or `8000`; `noise_reduction`: `16000` only). Must not change. |
 | `channels` | `1` (unset is accepted). |
 | `rtp_timestamp` | RTP timestamp of the **first sample** of the chunk, on the source clock. The first chunk anchors the timeline. A later value that does not continue from the audio received (a jump) re-anchors the timeline at that chunk and is logged at WARNING (the first 3 jumps of a stream, then every 500th); processing goes on. |
-| `rtp_clock_rate` | Source RTP clock, `8000` for G.711. `0` means "use `sample_rate`" as the proto defines, and is logged at WARNING. Must not change. |
+| `rtp_clock_rate` | Source RTP clock: `8000` for G.711 and for G.722 (its RTP clock stays 8 kHz although the audio is 16 kHz, RFC 3551), `16000` for L16. `0` means "use `sample_rate`" as the proto defines, and is logged at WARNING. Must not change. |
 | `chunk_seq` | Normally increases by 1 from its first value. A gap means the gateway dropped chunks from its send queue: it is logged at WARNING (the first 3 gaps of a stream, then every 500th) and processing goes on with the audio that arrived. `-1` on the first chunk turns the check off. |
 | `duration_ms` | Informational; the duration is computed from `pcm`. |
 | `end_of_stream` | `true`: the audio in this chunk is processed, the open utterance is committed, the stream is closed. Nothing after it is read. Closing the request stream without it has the same effect. |
-| `language` | `vi`, `en` or empty. With the default backend the model auto-detects the language, so this is only the value reported until the model names one. Unknown codes are logged and treated as empty. Read from the first chunk only. |
+| `language` | `vi`, `en`, `auto` or empty. Empty and unknown codes (logged) take `asr.default_language`; `auto` lets the model detect the language. With `asr.force_language: false` (default) the model detects the language anyway, so this is only the value reported until the model names one. Read from the first chunk only. |
 | `language_source` | Used instead of `language` only when `asr.use_language_source: true`. |
-| `task` | `speech_to_text` or empty. The gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. Must not change. |
+| `task` | `speech_to_text` or empty; `noise_reduction` when `noise_reduction.enabled: true`. A task that is off and the gateway's other tasks (`realtime_translation`, `keyword`, `voice_controller_emoji`) end the RPC with `UNIMPLEMENTED`; anything else with `INVALID_ARGUMENT`. The first chunk picks the task; it must not change. |
+| `output_audio_format` | Tag 14, ignored by `speech_to_text`. The format the gateway accepts for returned audio: absent/`LEGACY_ENCODED` = G.711 PCMU, `PCM_S16LE` = raw PCM 16 kHz (gateway `media.codec` g722 or l16). Used by `noise_reduction`, see below. |
 
 Send audio at real-time pace. The engine never slows the sender down; if more
 than `server.ingress_max_ms` of audio is waiting for ASR the RPC ends with
@@ -107,8 +132,8 @@ chunks: resampling each 80 ms chunk on its own creates discontinuities.
 | `utterance_id` (20) | Starts at 1. All PARTIALs up to a FINAL carry that FINAL's id. | Advances by 1 after each FINAL. |
 | `revision` (21) | Increases with every result of the utterance | Last revision + 1; restarts at 1 for the next utterance |
 | `seq` | Starts at 1, +1 for every result of the stream, no gaps | same |
-| `ts_start`, `ts_end` | RTP timestamps on the source clock, **modulo 2^32**, half-open `[ts_start, ts_end)`. Derived from the `rtp_timestamp` of the chunk that carried the audio (the latest anchor at or before that position) and the audio position; when `rtp_timestamp` jumped inside an utterance, `ts_start` is on the old timeline and `ts_end` on the new one. From VAD, **not** word timestamps; pre-roll and hangover are included. After a wrap `ts_end` is numerically smaller than `ts_start`. | same; `ts_end` is the end of the utterance |
-| `language` | `vi` or `en`: the language the model reports, else the one configured. Empty when the model reports any other language (logged at WARNING, the utterance is processed normally). | same |
+| `ts_start`, `ts_end` | RTP timestamps on the source clock (`rtp_clock_rate`: 8 ticks per ms for G.711 and G.722, 16 for L16), **modulo 2^32**, half-open `[ts_start, ts_end)`. Derived from the `rtp_timestamp` of the chunk that carried the audio (the latest anchor at or before that position) and the audio position; when `rtp_timestamp` jumped inside an utterance, `ts_start` is on the old timeline and `ts_end` on the new one. From VAD, **not** word timestamps; pre-roll and hangover are included. After a wrap `ts_end` is numerically smaller than `ts_start`. | same; `ts_end` is the end of the utterance |
+| `language` | `vi` or `en`: the forced language, else the language the model reports, else the one of the stream. Empty when the model reports any other language (logged at WARNING, the utterance is processed normally), or names none on an `auto` stream. | same |
 | `reason` (23) | `COMMIT_REASON_UNSPECIFIED` | See below |
 | `status` (24) | `RESULT_STATUS_OK` | `RESULT_STATUS_OK` (other values are reserved) |
 | `confidence` | `0.0`: no confidence is available, not "0 %" | same |
@@ -143,20 +168,107 @@ Cases that produce no FINAL (they are logged, not reported in `status`):
 - No PARTIAL is sent before the utterance has `vad.min_voiced_ms` of voiced
   audio, so an utterance the VAD later discards never shows a PARTIAL.
 
+### Word-by-word reveal (optional)
+
+With `word_reveal.enabled: true`, one PARTIAL of the model is sent as several
+PARTIALs, each carrying one more word. The contract above does not change: every
+PARTIAL is still the entire text to show, and `revision` and `seq` still grow by 1.
+
+- The first new word goes out at once, the others within `word_reveal.window_ms`.
+  Two results are at least `word_reveal.min_interval_ms` apart; when more words
+  wait than fit, they go out in groups.
+- A word the model corrected is replaced at the next send.
+- A FINAL or an empty PARTIAL goes out at once and cancels the words still waiting.
+  The text and timestamps of a FINAL are the same with the reveal on or off; only
+  its `revision` is higher, because more results came before it.
+
+The last word of a PARTIAL reaches the client up to `window_ms` later. With the
+default timing one PARTIAL of the model becomes at most 4 results, so at
+`asr.chunk_sec: 0.5` a stream sends at most 8 results per second. Use it with
+`asr.chunk_sec: 0.5`; `window_ms` must not be longer than `asr.chunk_sec`.
+
+### Task `noise_reduction` (DPDFNet-2)
+
+With `noise_reduction.enabled: true`, a stream whose first chunk has `task: noise_reduction`
+is denoised by DPDFNet-2 (sherpa-onnx `OnlineSpeechDenoiser`, CPU) and the audio goes back to
+the gateway, which plays it to the other party. Design:
+`../docs/DPDFNet2_Task_Routing_Design_VI.md`.
+
+On top of the request rules above: `sample_rate` must be `16000`, and
+`output_audio_format` (tag 14) fixes the format of the returned audio for the whole
+stream; another value than `LEGACY_ENCODED` / `PCM_S16LE`, or a change, is
+`INVALID_ARGUMENT`. `language` is not used.
+
+| Response field | Value |
+|---|---|
+| `audio_payload` | `noise_reduction.frame_ms` (20) of audio: 640 bytes of PCM16 LE 16 kHz when `output_audio_format` is `PCM_S16LE`, else 160 bytes of G.711 PCMU 8 kHz. The last one before the final may be shorter. |
+| `audio_format`, `audio_sample_rate` | `PCM_S16LE` and `16000`; unset (`LEGACY_ENCODED`) for PCMU |
+| `audio_pt` | `0` (PCMU) |
+| `is_final` | `false`, except one last result with empty `audio_payload`, after `end_of_stream` or the half-close and the model flush. A cancelled stream gets none. |
+| `ts_start` = `ts_end` | `rtp_timestamp` of the latest chunk given to the model (the gateway measures its latency with it); the final carries the one of the `end_of_stream` chunk |
+| `seq` | +1 for every result, the final included |
+| `text`, tags 20-24 | unset |
+
+- Audio comes back for every chunk, silence included: the gateway plays the original
+  audio for the rest of the call when it gets no audio for
+  `noise_reduction.fallback_after_ms` (500 ms) or the stream ends with an error. An
+  80 ms chunk gives 3 results the first time (the model holds back 10 ms), then 4.
+  The model's own delay is 40 ms.
+- Each stream uses one of the `noise_reduction.max_streams` denoisers loaded at start
+  (about 0.3 s and 20 MB each on the lab CPU). With none free the stream ends at once
+  with `RESOURCE_EXHAUSTED`; it is never queued. A cancelled stream gives its
+  denoiser back when its running model call returns; the denoiser is reset for the
+  next stream.
+- The model runs on `noise_reduction.workers` threads shared by all streams; the
+  calls of one stream run one at a time, in order.
+- Chunks are read as they arrive. When more than `noise_reduction.max_backlog_ms`
+  (500) of audio waits for the model, i.e. the CPU does not keep up, the stream ends
+  with `RESOURCE_EXHAUSTED` (`noise_reduction backlog` WARNING) and the gateway plays
+  the original audio for the rest of the call, instead of getting ever later audio
+  that it would still accept. The limit is checked as each chunk is read, against
+  the chunks not yet given to the model: while one chunk is in the model, a burst of
+  7 chunks of 80 ms (6 waiting, 480 ms) passes and 8 do not. It also counts a
+  gateway that reads the results slowly. `0` turns the limit off (at most 5000); set
+  it on a test server whose client sends faster than real time. With the limit off,
+  at most 64 chunks are read ahead and gRPC flow control holds back the rest. The
+  `end_of_stream` chunk is never refused by the limit: the stream ends with it. A gateway
+  with `noise_reduction.on_ai_failure: close` retries `RESOURCE_EXHAUSTED` up to
+  `ai.max_retry` times, then closes the session.
+- A chunk above 64 KB ends the stream with `RESOURCE_EXHAUSTED`, as for
+  `speech_to_text`.
+- A model error ends the stream with `UNAVAILABLE`, and that denoiser is replaced by
+  a newly loaded one.
+- One INFO line per stream when it ends: `noise_reduction stream ended ...
+  outcome=final|cancelled|invalid|model_error|backlog|read_error output=pcm_s16le|pcmu chunks= samples_in=
+  samples_out= samples_sent= clipped= results= first_audio_ms= model_ms_p50=
+  model_ms_p95= model_ms_max= queue_ms_p95= queue_ms_max= backlog_ms_max=
+  chunk_seq_gaps=`.
+  `model_ms` is the model time per chunk, `queue_ms` the wait for a free worker
+  thread: a growing `queue_ms` means too few `workers` for the streams.
+  `backlog_ms_max` is the most audio that waited for the model; `outcome=backlog`
+  when it went above `max_backlog_ms`.
+
+Measured on a laptop CPU (sherpa-onnx 2.0.2, one ONNX thread per denoiser): first
+audio 16 ms after the first chunk, 13-21 ms of model time per 80 ms chunk, the same
+output whatever the chunk size. Measure on the target CPU before choosing
+`max_streams` and `workers`.
+
 ### Status codes
 
 | Code | When |
 |---|---|
-| `INVALID_ARGUMENT` | Missing ids, bad `sample_rate`/`channels`, unknown `task`, odd `pcm` length, a session field changed |
-| `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword` or `voice_controller_emoji` |
-| `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB |
-| `UNAVAILABLE` | `asr.max_consecutive_errors` model failures in a row |
+| `INVALID_ARGUMENT` | Missing ids, bad `sample_rate`/`channels`, unknown `task`, odd `pcm` length, a session field changed; `noise_reduction`: unknown `output_audio_format` |
+| `UNIMPLEMENTED` | `task` is `realtime_translation`, `keyword` or `voice_controller_emoji`, or a task that is off (`noise_reduction.enabled` / `asr.enabled` false) |
+| `RESOURCE_EXHAUSTED` | More than `server.ingress_max_ms` of audio waiting for ASR, or a chunk above 64 KB; `noise_reduction`: all denoisers in use, or more than `noise_reduction.max_backlog_ms` of audio waiting for the model |
+| `UNAVAILABLE` | `asr.max_consecutive_errors` model failures in a row; `noise_reduction`: the denoiser failed |
 
 What the gateway does with them: `INVALID_ARGUMENT` and `UNIMPLEMENTED` are
 permanent for it, it does not reconnect and closes the session. After
 `RESOURCE_EXHAUSTED` or `UNAVAILABLE` it reconnects up to `ai.max_retry` (3)
 times with a growing backoff, then closes the session; the new stream starts
-with a `chunk_seq` other than 0, which is accepted.
+with a `chunk_seq` other than 0, which is accepted. Exception: a `noise_reduction`
+session with `noise_reduction.on_ai_failure: passthrough` (gateway default) is not
+closed; the gateway plays the caller's original audio until the call ends.
 
 A client that is still writing when the engine ends the RPC may see `INTERNAL`
 instead of the code above; do not branch on the exact code.
@@ -204,26 +316,42 @@ installs it into a run directory (default `/u01/ims/audio-engine`, or
 ```text
 <app home>/
 ├── bin/      start.sh stop.sh status.sh   replaced on every update
+│             rollback.sh wait_ready.sh _upgrade.sh   replaced on every update, kept by a rollback
 │             env.sh                        local settings (PYTHON, CUDA_VISIBLE_DEVICES); created once
 ├── config/   server.yaml logging.yaml      created once, never overwritten
 │             *.dist                        defaults of the installed version
 ├── lib/      asr_server/                   application code, replaced on every update
-│             asr_server.prev/              the version before, for rollback
+│             asr_server.prev/              the version before
+├── backup/   <date>-<time>/                replaced versions (code, bin, config), last 10 kept; UTC
+│             rolled-back/<date>-<time>/    versions replaced by a rollback, last 10 kept; UTC
 ├── logs/  model/  data/                    never touched
 └── VERSION
 ```
 
 ```bash
 bash scripts/update.sh              # build (scripts/build.sh), then install or update
-bash scripts/update.sh --restart    # same, stopping and restarting a running server
+bash scripts/update.sh --restart    # same, restarting the server and waiting until it is ready
 bash scripts/build.sh --test        # run the tests, then build into build/app
+<app home>/bin/rollback.sh --list   # show the saved versions
+<app home>/bin/rollback.sh [ID]     # go back to a saved version
 ```
 
 - On the first install the model paths of `config/server.yaml` are set to
-  `<app home>/model/...`; missing model files are reported.
+  `<app home>/model/...`. Missing model files of the tasks that are on are
+  reported (`asr.enabled`: ASR, punctuation, Silero; `noise_reduction.enabled`:
+  `dpdfnet2.onnx` and the `sherpa-onnx` package), before anything is changed;
+  relative model paths count from the run directory, where the server runs. A
+  server that was stopped is then installed but not started by `--restart`; a
+  running server is left alone and the update is refused (copy the models, then
+  update again).
 - An update validates the configuration found in the run directory against the
-  new code first. If it is not valid, or the server is running and `--restart`
-  was not given, nothing is changed.
+  new code and the installed code first. If it is not valid, or the server is
+  running and `--restart` was not given, nothing is changed. Add the keys of a
+  new version after the update.
+- A server that dies or does not open its port within `ASR_START_WAIT_SEC`
+  seconds (default 300) is reported with exit code 1 and is **not** rolled back,
+  so that the logs can be examined first.
+- `ASR_BACKUP_KEEP` and `ASR_START_WAIT_SEC` are read from `bin/env.sh`.
 - `bin/*.sh` are the same scripts in both places: they use `lib/` when it
   exists and `src/` otherwise, and read `bin/env.sh` when it exists.
 
@@ -244,6 +372,9 @@ Step-by-step instructions (Vietnamese): `HUONG_DAN_CAI_DAT.md`.
 - Both checkpoints must include all configs, tokenizer / preprocessor files
   and weight shards. Model `Horizon-Labs/punctuation-restoration-small` is a
   140M multilingual punctuation token classifier that includes Vietnamese.
+- Only with `noise_reduction.enabled: true`: the `sherpa-onnx==2.0.2` package and
+  the DPDFNet-2 16 kHz model `/opt/models/dpdfnet2.onnx` (about 10 MB, CPU). The
+  server never downloads it.
 
 ### Prepare on a machine WITH Internet
 
@@ -257,6 +388,12 @@ curl -fL --retry 3 \
   'https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.jit' \
   -o ./models/silero_vad.jit
 # Download from the official repository only; TorchScript contains executable code.
+# noise_reduction only: DPDFNet-2 16 kHz; check the SHA-256 before use.
+curl -fL --retry 3 \
+  'https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/dpdfnet2.onnx' \
+  -o ./models/dpdfnet2.onnx
+echo 'ce35d6025fc71df0ef10d1540e1b7916837bbfe5f6896deb744508d2cad487a9  models/dpdfnet2.onnx' | sha256sum -c
+python -m pip download -d wheelhouse sherpa-onnx==2.0.2
 
 # Use the SAME OS / Python ABI / CUDA-compatible wheel sources as your server.
 python -m pip download -d wheelhouse -r requirements.txt
@@ -308,6 +445,11 @@ The server sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` and
 Logs: `logs/asr-server.log`, rotated at midnight, 14 days kept
 (`config/logging.yaml`). When started through `bin/start.sh`, anything printed
 outside the logging system goes to `logs/asr-server.out`, which is not rotated.
+
+With `asr.log_results: true`, every PARTIAL and COMMIT of the model adds one INFO
+line `asr_result` with the language, the number of Han characters, the model answer
+and the text before and after punctuation. It is off by default because the log
+then holds the content of the calls.
 
 Optional early semantic commits (higher risk of over-segmentation), in
 `config/server.yaml`:
@@ -386,12 +528,32 @@ speakers before ASR.
 ```bash
 python -m pip install -r requirements-dev.txt torch
 scripts/run_tests.sh            # server tests, then tools/eval tests
-python -m pytest tests -q       # server tests only
+python -m pytest tests -q       # server tests only, in one process (see below)
 ```
+
+`scripts/run_tests.sh` runs each file of `tests/` that starts a real gRPC server (or
+calls `serve()`) in its own interpreter (`GRPC_SERVER_TESTS`, kept complete by
+`tests/test_run_tests_script.py`). In one process, a full run on Windows sometimes hung
+in `tests/test_serve_noise.py` after `test_regression.py` (reproduced with those two
+files): the gRPC aio poller thread, shared by the process, was gone after an earlier
+test's event loop closed. The split makes that far less likely; it was never seen within
+one file. The `tools/eval` tests still run in one process (no hang seen there). The
+server itself runs one event loop. Extra arguments of the script are pytest options;
+every run gets them and the script goes on after a failure.
 
 Unit/integration tests use a deterministic fake ASR and local fake punctuation
 model; this tests streaming, VAD transitions, event semantics and word
 preservation, **not** checkpoint WER, punctuation F1 or GPU latency.
+
+`noise_reduction` is tested with a stand-in denoiser that behaves like DPDFNet-2.
+`tests/test_noise_real_model.py` runs the real model instead and is skipped unless
+`sherpa-onnx` is installed and the model file is given:
+
+```bash
+ASR_TEST_DPDFNET2_MODEL=/opt/models/dpdfnet2.onnx python -m pytest tests/test_noise_real_model.py -s
+```
+
+It needs neither torch nor vLLM, and prints the stream's summary log line.
 
 ## Deployment limitations
 
@@ -408,6 +570,11 @@ preservation, **not** checkpoint WER, punctuation F1 or GPU latency.
 5. Keep `raw_text` and `text` for QA and troubleshooting. Never let a
    generative postprocessor silently change phone numbers, service codes
    or content of an immutable FINAL.
+6. `noise_reduction` has only been run with the real model on a laptop CPU and
+   with test clients, not with the gateway and MF on real calls; its quality on
+   Vietnamese telephone noise is not assessed yet. Choose
+   `noise_reduction.max_streams` and `workers` from a measurement on the target
+   CPU (see the `model_ms` and `queue_ms` of the summary line).
 
 ## Evaluation client
 
