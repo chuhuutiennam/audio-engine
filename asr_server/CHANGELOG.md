@@ -62,6 +62,10 @@
 - A refused update writes the new defaults to `config/*.dist.new` and leaves `config/*.dist` alone.
 - A stream without a language took the fixed `Vietnamese`; it now takes `asr.default_language`
   (same result with the default `vi`). The `start` log line shows the language of the stream.
+- `noise_reduction` is for wideband calls only (gateway `media.codec` g722 or l16); rtpgw
+  does not use it for G.711 (`pcm`). On band-limited G.711 audio, DPDFNet-2 turns many loud
+  passages down by more than 20 dB, and the gateway cannot tell. The measurements are in
+  §3.3 of the design doc (version 1.4). Docs only: the engine still serves PCMU output.
 - `speech.proto` comments and README: the engine also serves `noise_reduction`; `speech_to_text`
   ignores `output_audio_format`; `ts_start`/`ts_end` are ticks of `rtp_clock_rate` (8 per ms for
   G.711 and G.722, 16 for L16). Comments only: `speech_pb2.py` is unchanged. Two tests cover
