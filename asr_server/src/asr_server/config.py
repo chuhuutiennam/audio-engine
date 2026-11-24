@@ -73,6 +73,14 @@ class Settings:
     noise_workers: int = 2                    # threads that run the denoisers of all streams
     noise_max_streams: int = 16               # denoisers loaded at start; one per stream
     noise_max_backlog_ms: int = 500           # audio waiting for the model; above it the stream ends
+    # asr_denoise: DPDFNet-2 in front of VAD and ASR in speech_to_text
+    stt_denoise_enabled: bool = False
+    stt_denoise_model: str = '/opt/models/dpdfnet2.onnx'
+    stt_denoise_num_threads: int = 1          # ONNX threads of each denoiser
+    stt_denoise_workers: int = 2              # threads that run the denoisers of all streams
+    stt_denoise_max_streams: int = 16         # denoisers loaded at start; more streams: no denoising
+    stt_denoise_max_backlog_ms: int = 500     # audio waiting for the model; above it: input as is
+    stt_denoise_apply_to: str = 'wideband'    # wideband (G.722/L16 calls) | all
 
     @property
     def word_reveal(self):
@@ -134,6 +142,13 @@ _KEYS = {
     ('noise_reduction', 'workers'): 'noise_workers',
     ('noise_reduction', 'max_streams'): 'noise_max_streams',
     ('noise_reduction', 'max_backlog_ms'): 'noise_max_backlog_ms',
+    ('asr_denoise', 'enabled'): 'stt_denoise_enabled',
+    ('asr_denoise', 'model'): 'stt_denoise_model',
+    ('asr_denoise', 'num_threads'): 'stt_denoise_num_threads',
+    ('asr_denoise', 'workers'): 'stt_denoise_workers',
+    ('asr_denoise', 'max_streams'): 'stt_denoise_max_streams',
+    ('asr_denoise', 'max_backlog_ms'): 'stt_denoise_max_backlog_ms',
+    ('asr_denoise', 'apply_to'): 'stt_denoise_apply_to',
 }
 _SECTIONS = sorted({section for section, _ in _KEYS})
 _TYPES = {f.name: f.type for f in fields(Settings)}
@@ -217,6 +232,18 @@ def _validate(s: Settings):
         raise ConfigError('noise_reduction.max_backlog_ms must be between 0 (off) and 5000')
     if s.noise_enabled and s.noise_max_streams > s.max_streams:
         raise ConfigError('noise_reduction.max_streams must not be above server.max_streams')
+    if s.stt_denoise_num_threads < 1 or s.stt_denoise_workers < 1 or s.stt_denoise_max_streams < 1:
+        raise ConfigError('asr_denoise.num_threads, workers and max_streams must be >= 1')
+    if not 0 <= s.stt_denoise_max_backlog_ms <= 5000:
+        raise ConfigError('asr_denoise.max_backlog_ms must be between 0 (off) and 5000')
+    # wideband: only calls the gateway carries as G.722 or L16 (AudioChunk.output_audio_format
+    # PCM_S16LE). On band-limited G.711 audio DPDFNet-2 turned down much of the speech.
+    if s.stt_denoise_apply_to not in ('wideband', 'all'):
+        raise ConfigError("asr_denoise.apply_to must be 'wideband' or 'all'")
+    if s.stt_denoise_enabled and not s.asr_enabled:
+        raise ConfigError('asr_denoise.enabled needs asr.enabled: it runs in front of speech_to_text')
+    if s.stt_denoise_enabled and s.stt_denoise_max_streams > s.max_streams:
+        raise ConfigError('asr_denoise.max_streams must not be above server.max_streams')
 
 
 def load_settings(path, overrides=None) -> Settings:

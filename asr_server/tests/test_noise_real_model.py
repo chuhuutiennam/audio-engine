@@ -21,8 +21,8 @@ pytestmark = pytest.mark.skipif(not os.path.isfile(MODEL),
                                 reason='set ASR_TEST_DPDFNET2_MODEL to the dpdfnet2.onnx file')
 
 from asr_server.audio import decode_audio                     # noqa: E402
-from asr_server.denoise import (OUTPUT_PCM16, OUTPUT_PCMU, DenoiserPool,  # noqa: E402
-                                NoiseStream, dpdfnet2_factory)
+from asr_server.denoise import (MODEL_DELAY, OUTPUT_PCM16, OUTPUT_PCMU,  # noqa: E402
+                                DenoiserPool, DPDFNet2Processor, NoiseStream, dpdfnet2_factory)
 from asr_server.messages import PCMU                          # noqa: E402
 from asr_server.noise_service import NoiseReductionService    # noqa: E402
 from asr_server.proto import speech_pb2 as pb                 # noqa: E402
@@ -81,7 +81,25 @@ def test_model_delay_is_40_ms():
     x[1000] = 0.5
     y = np.concatenate([np.asarray(model.run(x[p:p + 320], RATE).samples) for p in range(0, RATE, 320)]
                        + [np.asarray(model.flush().samples)])
-    assert int(np.argmax(np.abs(y))) - 1000 == 640
+    assert int(np.argmax(np.abs(y))) - 1000 == 640 == MODEL_DELAY
+
+
+@pytest.mark.parametrize('chunk', [320, 640, 1280])
+def test_aligned_processor_keeps_the_input_timeline(chunk):
+    """speech_to_text preprocessing: as many samples as in, and no delay left (VAD/ASR timestamps)."""
+    # A lone click, as in test_model_delay_is_40_ms (the periodic test signal would make a
+    # cross-correlation peak one period off): it must come out where it went in.
+    x = np.zeros(RATE, dtype=np.float32)
+    x[1000] = 0.5
+    processor = DPDFNet2Processor(dpdfnet2_factory(MODEL)(), align=True)
+    y = np.concatenate([processor.run(x[p:p + chunk]) for p in range(0, len(x), chunk)] + [processor.finish()])
+    assert len(y) == len(x) and processor.filled == 0
+    assert int(np.argmax(np.abs(y))) == 1000
+    # and on noisy audio: as many samples out as in, for any chunk size
+    pcm = decode_audio(noisy_speech_like(), 3)
+    processor = DPDFNet2Processor(dpdfnet2_factory(MODEL)(), align=True)
+    y = np.concatenate([processor.run(pcm[p:p + chunk]) for p in range(0, len(pcm), chunk)] + [processor.finish()])
+    assert len(y) == len(pcm) and processor.filled == 0
 
 
 def test_pcmu_path_returns_8khz_audio_for_every_chunk():

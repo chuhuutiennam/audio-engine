@@ -78,3 +78,18 @@ noise_reduction:             # task noise_reduction: DPDFNet-2 on CPU, audio bac
   max_backlog_ms: 500        # more audio than this waiting for the model (the CPU does not keep up):
                              # the stream ends with RESOURCE_EXHAUSTED and the gateway plays the
                              # original audio for the rest of the call. 0 = no limit, at most 5000
+
+asr_denoise:                 # speech_to_text: DPDFNet-2 (CPU) in front of VAD and ASR
+  enabled: false             # false: VAD and ASR get the audio as sent. true needs sherpa-onnx and
+                             # the model file, and asr.enabled
+  model: /opt/models/dpdfnet2.onnx   # local file, never downloaded by the server
+  apply_to: wideband         # wideband: only calls the gateway carries as G.722 or L16; G.711 calls
+                             # go through as sent (DPDFNet-2 turned down much of their speech).
+                             # all: every stream (tests only)
+  num_threads: 1             # ONNX threads of each denoiser
+  workers: 2                 # threads that run the denoisers of all streams
+  max_streams: 16            # denoisers loaded at start (~20 MB each); a stream that finds none
+                             # free is recognised from the audio as sent. Not above server.max_streams
+  max_backlog_ms: 500        # more audio than this waiting for the model (the CPU does not keep up):
+                             # the stream goes on with the audio as sent, from the next sample.
+                             # 0 = no limit, at most 5000

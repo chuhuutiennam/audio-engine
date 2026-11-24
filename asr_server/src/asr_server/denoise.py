@@ -1,19 +1,24 @@
-"""DPDFNet-2 speech denoising for the task noise_reduction.
+"""DPDFNet-2 speech denoising: the task noise_reduction and the speech_to_text preprocessing.
 
 Design: docs/DPDFNet2_Task_Routing_Design_VI.md (audio-engine repo root), sections 5 and 7.
 
 - DenoiserPool: every denoiser is loaded at start. Loading one took 0.24-0.36 s on a laptop
   CPU, and the gateway gives up on a stream that returns no audio for 500 ms. A stream borrows
   one and gives it back reset.
-- NoiseStream: the audio path of one stream. In: PCM16 LE mono 16 kHz. Out: frames of
-  frame_ms, either PCM16 LE mono 16 kHz or G.711 PCMU 8 kHz (AudioChunk.output_audio_format).
-  Its calls block while the model runs: the gRPC layer runs them off the event loop, one at
-  a time per stream.
+- DPDFNet2Processor: the model path of one stream, shared by both uses. In and out: 16 kHz
+  audio. align=True (speech_to_text) removes the model's delay so that VAD and ASR keep the
+  input's timeline.
+- NoiseStream: the audio path of one noise_reduction stream. In: PCM16 LE mono 16 kHz. Out:
+  frames of frame_ms, either PCM16 LE mono 16 kHz or G.711 PCMU 8 kHz
+  (AudioChunk.output_audio_format).
+Their calls block while the model runs: the gRPC layer runs them off the event loop, one at a
+time per stream.
 
 The model (sherpa_onnx.OnlineSpeechDenoiser, or a stand-in in the tests) needs
 run(samples, sample_rate), flush() and reset(); run() and flush() return an object with
-.samples and .sample_rate. DPDFNet-2 holds back one 10 ms hop and flush() returns it, so the
-samples out add up to the samples in.
+.samples and .sample_rate. Measured on DPDFNet-2 with sherpa-onnx 2.0.2: run() returns whole
+10 ms hops and keeps the last one back, flush() returns what is left, so the samples out add up
+to the samples in; the audio comes out MODEL_DELAY samples (40 ms) late, whatever the chunk size.
 """
 import logging
 import os
@@ -30,6 +35,7 @@ SAMPLE_RATE = 16000
 OUTPUT_PCM16 = 'pcm_s16le'     # PCM16 LE mono 16 kHz: 640 bytes per 20 ms
 OUTPUT_PCMU = 'pcmu'           # G.711 mu-law 8 kHz: 160 bytes per 20 ms
 FRAME_MS = (20, 40, 80)        # the gateway wants multiples of 20 ms
+MODEL_DELAY = 640              # samples (40 ms): output n carries input n - 640 (cross-correlation)
 
 
 def dpdfnet2_factory(model_path, num_threads=1):
@@ -60,11 +66,136 @@ def dpdfnet2_factory(model_path, num_threads=1):
     return make
 
 
+def check_model_delay(factory):
+    """Raise ValueError unless a fresh denoiser from `factory` delays audio by MODEL_DELAY.
+
+    align=True relies on that number; another model file or sherpa-onnx version could differ
+    and would put VAD/ASR off the input timeline with no error. A lone click is fed in 20 ms
+    chunks; its peak comes out MODEL_DELAY samples later (the model removes most of the click,
+    so the float output is read, not PCM16). Blocks for one model load and 1 s of audio.
+    """
+    denoiser = factory()
+    x = np.zeros(SAMPLE_RATE, dtype=np.float32)
+    x[1000] = 0.5
+    y = np.concatenate([np.asarray(denoiser.run(x[p:p + 320], SAMPLE_RATE).samples, dtype=np.float32)
+                        for p in range(0, len(x), 320)] + [np.asarray(denoiser.flush().samples, dtype=np.float32)])
+    delay = int(np.argmax(np.abs(y))) - 1000
+    if delay != MODEL_DELAY:
+        raise ValueError(f'the denoiser delays audio by {delay} samples, not {MODEL_DELAY}: '
+                         'asr_denoise supports DPDFNet-2 dpdfnet2.onnx with sherpa-onnx 2.0.2 only')
+    return delay
+
+
 def _to_pcm16(samples):
     """float [-1, 1] -> int16, saturating; returns (samples, how many were clipped)."""
     scaled = np.round(np.asarray(samples, dtype=np.float32) * 32768.0)
     clipped = int(np.count_nonzero((scaled > 32767) | (scaled < -32768)))
     return np.clip(scaled, -32768, 32767).astype(np.int16), clipped
+
+
+class DPDFNet2Processor:
+    """DPDFNet-2 on one stream: 16 kHz mono in, 16 kHz mono out. Not thread-safe: one call at a time.
+
+    run(samples) takes float audio in [-1, 1] and returns the float samples ready now; finish()
+    returns the rest, once. feed(pcm) / flush() do the same with PCM16 LE bytes. The model keeps
+    its state from call to call; nothing here resets it.
+
+    align=False: the model's output as it is (noise_reduction).
+    align=True: output sample k is input sample k, denoised. The first MODEL_DELAY samples the
+      model returns are dropped, and finish() feeds MODEL_DELAY samples of silence before the
+      model flush, so the output has exactly as many samples as the input, on its timeline
+      (VAD and ASR timestamps stay right). The input not yet returned is kept for bypass() and
+      for a model that would return too few samples at the end (`filled` counts those).
+
+    bypass(reason), align=True only: from now on the input passes unchanged, starting with the
+    input samples not yet returned, so no sample is lost or repeated. The model is not called
+    any more.
+    """
+
+    def __init__(self, denoiser, *, align=False):
+        self.denoiser = denoiser
+        self.align = align
+        self._skip = MODEL_DELAY if align else 0        # model output still to drop
+        self._pending = np.zeros(0, dtype=np.float32)   # align: input not yet returned
+        self.finished = False
+        self.bypassed = None            # reason, once bypass() was called
+        self.samples_in = 0
+        self.samples_out = 0
+        self.filled = 0                 # samples the model did not return, taken from the input
+        self.clipped = 0                # in feed() / flush()
+
+    def _model(self, result):
+        if result.sample_rate != SAMPLE_RATE:
+            raise RuntimeError(f'denoiser returned {result.sample_rate} Hz audio, expected {SAMPLE_RATE}')
+        out = np.asarray(result.samples, dtype=np.float32).reshape(-1)
+        if self._skip:
+            drop = min(self._skip, len(out))
+            self._skip -= drop
+            out = out[drop:]
+        return out
+
+    def _ready(self, out):
+        if self.align:
+            self._pending = self._pending[len(out):]
+        self.samples_out += len(out)
+        return out
+
+    def run(self, samples):
+        if self.finished:
+            raise RuntimeError('denoiser stream already finished')
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+        self.samples_in += len(samples)
+        if self.align:
+            self._pending = np.concatenate([self._pending, samples])
+        if self.bypassed is not None:
+            return self._ready(self._pending.copy())
+        if not len(samples):
+            return samples
+        return self._ready(self._model(self.denoiser.run(samples, SAMPLE_RATE)))
+
+    def finish(self):
+        """End of the stream: the rest of the audio. The model is flushed once (not after bypass).
+
+        When the model fails here, the stream stays open: after bypass(), finish() returns the
+        input not yet returned, so the end of the stream is not lost."""
+        if self.finished:
+            raise RuntimeError('denoiser stream already finished')
+        if self.bypassed is not None:
+            self.finished = True
+            return self._ready(self._pending.copy())
+        parts = []
+        if self.align:
+            parts.append(self._model(self.denoiser.run(np.zeros(MODEL_DELAY, dtype=np.float32), SAMPLE_RATE)))
+        parts.append(self._model(self.denoiser.flush()))
+        self.finished = True
+        out = np.concatenate(parts)
+        if self.align:
+            missing = len(self._pending) - len(out)
+            if missing > 0:             # never fewer samples than in: the ASR timeline would drift
+                LOG.warning('denoiser returned %d samples fewer than it was given; the input fills them',
+                            missing)
+                self.filled = missing
+                out = np.concatenate([out, self._pending[len(out):]])
+            out = out[:len(self._pending)]
+        return self._ready(out)
+
+    def bypass(self, reason):
+        if not self.align:
+            raise RuntimeError('bypass needs align=True: only then is the input on the output timeline')
+        if self.bypassed is None:
+            self.bypassed = reason
+
+    def feed(self, pcm):
+        """PCM16 LE mono 16 kHz in and out."""
+        return self._pcm16(self.run(decode_audio(pcm, PCM_S16LE)))
+
+    def flush(self):
+        return self._pcm16(self.finish())
+
+    def _pcm16(self, samples):
+        pcm, clipped = _to_pcm16(samples)
+        self.clipped += clipped
+        return pcm.astype('<i2').tobytes()
 
 
 class NoiseStream:
@@ -76,6 +207,7 @@ class NoiseStream:
         if frame_ms not in FRAME_MS:
             raise ValueError(f'frame_ms must be one of {FRAME_MS}, got {frame_ms}')
         self.denoiser = denoiser
+        self._model = DPDFNet2Processor(denoiser, align=False)   # the model's output as it is
         self.output = output
         if output == OUTPUT_PCMU:
             # One stateful resampler for the whole stream: no discontinuity between chunks.
@@ -99,7 +231,7 @@ class NoiseStream:
             return []
         samples = decode_audio(pcm, PCM_S16LE)
         self.samples_in += len(samples)
-        self._add(self.denoiser.run(samples, SAMPLE_RATE), last=False)
+        self._add(self._model.run(samples), last=False)
         return self._frames()
 
     def finish(self):
@@ -107,17 +239,14 @@ class NoiseStream:
         if self.finished:
             raise RuntimeError('noise stream already finished')
         self.finished = True
-        self._add(self.denoiser.flush(), last=True)
+        self._add(self._model.finish(), last=True)
         frames = self._frames()
         if self._pending:
             frames.append(bytes(self._pending))
             self._pending.clear()
         return frames
 
-    def _add(self, result, *, last):
-        if result.sample_rate != SAMPLE_RATE:
-            raise RuntimeError(f'denoiser returned {result.sample_rate} Hz audio, expected {SAMPLE_RATE}')
-        samples = np.asarray(result.samples, dtype=np.float32).reshape(-1)
+    def _add(self, samples, *, last):
         self.samples_out += len(samples)
         if self._downsampler is not None:
             samples = self._downsampler.push(samples)
