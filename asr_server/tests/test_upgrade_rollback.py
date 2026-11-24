@@ -1,5 +1,6 @@
 """scripts/update.sh --restart and bin/rollback.sh: every script is the real one, only the model
 server is replaced by a small stand-in that listens on the configured port."""
+from datetime import datetime, timedelta, timezone
 import os
 import shutil
 import socket
@@ -8,7 +9,7 @@ import sys
 
 import pytest
 
-from test_deploy_scripts import script, source, update  # noqa: F401  (source is a fixture)
+from test_deploy_scripts import ROOT, script, source, update  # noqa: F401  (source is a fixture)
 
 pytestmark = pytest.mark.skipif(os.name != 'posix' or shutil.which('bash') is None,
                                 reason='the deployment scripts need bash')
@@ -548,3 +549,59 @@ def test_rollback_reports_a_restored_version_that_does_not_start(source, home): 
     assert result.returncode == 1
     assert 'did not become ready' in result.stderr
     assert health(home) == ['health=failed']
+
+
+# --- names of the saved versions ---
+
+def backup_id(directory, tz='ICT-7'):
+    """new_backup_id under a POSIX TZ string (named zones need tzdata and silently mean UTC without it)."""
+    script = f'set -euo pipefail; source "{ROOT}/bin/_upgrade.sh"; new_backup_id "$1"'
+    out = subprocess.run(['bash', '-c', script, '_', str(directory)], capture_output=True, text=True,
+                         env={**os.environ, 'TZ': tz}, timeout=20)
+    return out
+
+
+def utc_id(moment):
+    return moment.strftime('%Y%m%d-%H%M%S')
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def test_a_backup_is_named_in_utc_whatever_the_time_zone(tmp_path):
+    # review: local time made a newer version sort before an older one when the clock went back
+    for tz in ('ICT-7', 'EST5EDT', 'UTC0'):
+        local = subprocess.run(['date', '+%H'], capture_output=True, text=True, env={**os.environ, 'TZ': tz})
+        utc = subprocess.run(['date', '-u', '+%H'], capture_output=True, text=True)
+        assert tz == 'UTC0' or local.stdout != utc.stdout, f'{tz} is not applied by date here'
+        before = utc_id(utc_now())
+        out = backup_id(tmp_path, tz)
+        after = utc_id(datetime.now(timezone.utc))
+        assert out.returncode == 0 and before <= out.stdout.strip() <= after, (tz, out)
+
+
+def test_a_new_backup_sorts_after_a_newer_saved_name(tmp_path):
+    # A name saved in local time before the change, here 3 hours ahead of UTC (not the TZ offset).
+    ahead = utc_now() + timedelta(hours=3)
+    (tmp_path / utc_id(ahead)).mkdir()
+    out = backup_id(tmp_path, 'UTC0')
+    assert out.stdout.strip() == utc_id(ahead + timedelta(seconds=1)), out
+
+
+def test_two_backups_in_the_same_second_get_different_names(tmp_path):
+    first = backup_id(tmp_path).stdout.strip()
+    (tmp_path / first).mkdir()
+    second = backup_id(tmp_path).stdout.strip()
+    assert second > first, (first, second)
+
+
+@pytest.mark.parametrize('name', ['20261399-999999', '99991231-235959'])
+def test_a_saved_name_that_is_no_date_or_far_ahead_is_ignored(tmp_path, name):
+    # review (important): an invalid date made new_backup_id loop forever; a far-future name gave a
+    # 9-digit year that no listing accepts
+    (tmp_path / name).mkdir()
+    before = utc_id(utc_now())
+    out = backup_id(tmp_path)
+    assert out.returncode == 0 and before <= out.stdout.strip() <= utc_id(utc_now()), out
+    assert 'ignored' in out.stderr

@@ -42,6 +42,9 @@
 
 ### Changed
 
+- Saved versions in `backup/` (and `backup/rolled-back/`) are named in UTC, always after the
+  newest saved name: in local time, a clock going back could make a newer version sort as older
+  (wrong rollback default, newest version pruned). Names saved before stay in local time.
 - `scripts/update.sh` reports missing models only for the tasks that are on: with
   `asr.enabled: false` it no longer asks for the ASR, punctuation and Silero models (a
   noise-only server is started by `--restart`); with `noise_reduction.enabled: true` it reports

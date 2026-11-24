@@ -15,7 +15,7 @@
 #            *.dist = the defaults of the installed version, for comparison
 #            *.dist.new = the defaults of a version whose update was refused
 #   lib/     asr_server/ = application code (replaced); asr_server.prev/ = the version before
-#   backup/  <date>-<time>/ = the versions replaced by the last updates, for bin/rollback.sh
+#   backup/  <date>-<time>/ = the versions replaced by the last updates, for bin/rollback.sh (UTC)
 #   logs/ model/ data/  (created once, never touched)
 #
 # Settings in bin/env.sh: ASR_BACKUP_KEEP (saved versions, default 10),

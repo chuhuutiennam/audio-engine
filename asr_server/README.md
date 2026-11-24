@@ -322,8 +322,8 @@ installs it into a run directory (default `/u01/ims/audio-engine`, or
 │             *.dist                        defaults of the installed version
 ├── lib/      asr_server/                   application code, replaced on every update
 │             asr_server.prev/              the version before
-├── backup/   <date>-<time>/                replaced versions (code, bin, config), last 10 kept
-│             rolled-back/<date>-<time>/    versions replaced by a rollback, last 10 kept
+├── backup/   <date>-<time>/                replaced versions (code, bin, config), last 10 kept; UTC
+│             rolled-back/<date>-<time>/    versions replaced by a rollback, last 10 kept; UTC
 ├── logs/  model/  data/                    never touched
 └── VERSION
 ```

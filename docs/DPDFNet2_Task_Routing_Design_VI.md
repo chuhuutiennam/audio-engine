@@ -1,6 +1,6 @@
 # THIẾT KẾ THỐNG NHẤT: AUDIO ENGINE TASK ROUTING VÀ DPDFNet-2 STREAMING 16 kHz
 
-**Phiên bản:** 1.2 — 23/11/2026 (1.1 → 1.2: AI Engine đã code `noise_reduction` trên nhánh `feature/noise-reduction`; 1.0 → 1.1: đối chiếu code Gateway nhánh `feature/noise-reduction-service`; xem "Lịch sử thay đổi" cuối tài liệu)  
+**Phiên bản:** 1.3 — 24/11/2026 (1.2 → 1.3: Gateway phát hết phần đuôi khi đóng session `noise_reduction`; 1.1 → 1.2: AI Engine đã code `noise_reduction` trên nhánh `feature/noise-reduction`; 1.0 → 1.1: đối chiếu code Gateway nhánh `feature/noise-reduction-service`; xem "Lịch sử thay đổi" cuối tài liệu)  
 **Phạm vi:** Media Function (MF) ↔ RTP Gateway ↔ AI Audio Engine  
 **Giao thức AI:** `speech.SpeechStream/Recognize` — gRPC hai chiều  
 **Nguồn tổng hợp:** `DPDFNet2_Task_Routing_Design.md`, `wideband-codec-g722-l16-solution-v2-ai16k-VI.md`; code và tài liệu Gateway `media_ai` (nhánh `feature/noise-reduction-service`: `internal/ai/proto/speech.proto`, `docs/wideband-codec-g722-l16-solution.md`). File `speech_ai_wideband_v2.proposed.proto` mà bản 1.0 dẫn **không có trong repo**; proto hợp lệ là `media_ai/internal/ai/proto/speech.proto` (Gateway) và `asr_server/src/asr_server/proto/speech.proto` (AI, cùng tag).
@@ -33,7 +33,7 @@
 ### 1.3. Phân biệt trạng thái triển khai và thiết kế
 
 - **Audio Engine:** bản `audio-engine-dpdfnet2-task-router.zip` **không có trong repo**; `noise_reduction` được viết mới trên nhánh `feature/noise-reduction` (tạo từ `feature/word-reveal`, chưa merge): khóa `asr.enabled` và mục `noise_reduction` trong `config.py`, định tuyến theo task, DPDFNet-2 qua sherpa-onnx 2.0.2, hai đường ra theo field 14. Proto AI đã đồng bộ tag 14/15/16 (`1eacc31`). **Đã chạy** với model DPDFNet-2 thật trên CPU laptop qua client test (in-process và gRPC); **chưa chạy** với Gateway và MF thật, chưa đo trên CPU máy chủ, chưa đánh giá chất lượng trên thoại tiếng Việt.
-- **Gateway** (nhánh `feature/noise-reduction-service`, chưa merge `master`): đã có G.722/L16 + `audio_format` 15/16 (S1–S8); dịch vụ `noise_reduction` (`d84df2f`); fallback phát audio gốc khi AI lỗi (F1–F4, `e32bdd0`…`84f4ac5`); chờ có giới hạn trước khi bỏ result có audio (`e3d4ee5`, `7468676`, `da6b0fa`); đệm phát pacer (`f4687fa`, `eeeb905`); gửi `output_audio_format` field 14 (23/11/2026, chưa commit). Đã chạy thật với mock worker (log/pcap trong `wideband-codec-g722-l16-solution.md`); **chưa kiểm thử với MF thật**.
+- **Gateway** (nhánh `feature/noise-reduction-service`, chưa merge `master`): đã có G.722/L16 + `audio_format` 15/16 (S1–S8); dịch vụ `noise_reduction` (`d84df2f`); fallback phát audio gốc khi AI lỗi (F1–F4, `e32bdd0`…`84f4ac5`); chờ có giới hạn trước khi bỏ result có audio (`e3d4ee5`, `7468676`, `da6b0fa`); đệm phát pacer (`f4687fa`, `eeeb905`); gửi `output_audio_format` field 14 (`336bd7c`); phát hết phần đuôi khi đóng session (`e7cec01`); mock MF + lab với AI engine thật (`90bd2b8`, `scripts/lab-noise-reduction.sh`). Đã chạy thật với mock worker và với AI engine thật (lab 24/11/2026); **chưa kiểm thử với MF thật**.
 - **Tích hợp:** chưa có kiểm thử end-to-end với **DPDFNet-2 checkpoint thật + Gateway wideband + MF RTP thật**. Không coi kiểm thử bằng mock worker là nghiệm thu chất lượng âm thanh.
 
 ## 2. Kiến trúc tổng thể
@@ -159,7 +159,7 @@ Ràng buộc từ Gateway: mỗi result PCM nên mang **bội của 640 byte** (
 4. Khi FIFO có từ 320 mẫu trở lên, trích ra mỗi khối 320 mẫu, phát `RecognitionResult(audio_format=PCM_S16LE, audio_sample_rate=16000, is_final=false, ts_end=<rtp_timestamp chunk vào mới nhất>)` ngay. Có thể gom 640 mẫu nếu cấu hình output 40 ms. Chế độ legacy: `audio_format=LEGACY_ENCODED`, `audio_pt=0`, payload PCMU 160 byte/20 ms.
 5. Duy trì FIFO phần dư; **không thêm zero padding sau mỗi lần `run()`**, không reset model lúc im lặng và không trộn lại input ở mức 6/12 dB theo mặc định.
 6. Mọi tác vụ inference trên cùng stream phải tuần tự; không gọi blocking inference trực tiếp trên event loop gRPC. Nhiều stream được phục vụ song song trong giới hạn worker/tài nguyên.
-7. Cuối luồng: xử lý hết PCM đầu vào; gọi `denoiser.flush()` **một lần**; đưa các mẫu còn lại vào FIFO; gửi toàn bộ khối đầy đủ và một khối cuối có thể ngắn hơn 20 ms; sau đó phát bản tin final rỗng. (Gateway chỉ gửi EOS khi session đã đóng nên phần đuôi này không được phát cho MF, xem §5.3; vẫn gửi để đúng hợp đồng và để client test/eval nhận đủ.)
+7. Cuối luồng: xử lý hết PCM đầu vào; gọi `denoiser.flush()` **một lần**; đưa các mẫu còn lại vào FIFO; gửi toàn bộ khối đầy đủ và một khối cuối có thể ngắn hơn 20 ms; sau đó phát bản tin final rỗng. Gateway (từ `e7cec01`) vẫn phát phần đuôi này cho MF khi đóng session, xem §5.3.
 
 **Độ trễ:** Trước đây đo được khoảng 40 ms lệch thời gian ở một bộ test. Đây là giá trị quan sát, **không hardcode bù 40 ms trong media path** trước khi xác nhận chính xác mapping offset/timestamp và phiên bản model/runtime.
 
@@ -174,7 +174,7 @@ Ràng buộc từ Gateway: mỗi result PCM nên mang **bội của 640 byte** (
 - Không gửi final định kỳ 20/40/80 ms và không gửi final do VAD. Một final giữa cuộc gọi khiến Gateway `PCMEncoder.Flush()` và có thể chèn im lặng nhân tạo cuối khung.
 - Khi nhận `AudioChunk.end_of_stream=true` hoặc client **half-close có trật tự**, server hoàn tất xử lý và phát **đúng một** final rỗng: `audio_payload=b""`, `is_final=true`, `audio_format` theo `output_audio_format` của stream (PCM: kèm `audio_sample_rate=16000`), `seq` tăng một lần. Gateway nhận final rỗng ở cả session G.711 lẫn G.722/L16: chỉ xả phần dư, không kiểm định dạng (`audio_egress.go`).
 - Khi client hủy RPC cưỡng bức (gồm cả lúc Gateway chuyển sang fallback, §5.5): giải phóng state và ghi metric; không cam kết gửi được final. Không phát final trùng nếu cùng lúc có EOS flag và half-close.
-- **Mất phần đuôi khi đóng session là chấp nhận được** (quyết định 23/11/2026). Gateway chỉ gửi EOS trong bước xả **sau khi** session đã chuyển `CLOSING` (`session/manager.go`: `beginClose` rồi mới chạy drainer); ở `CLOSING`, egress đã dừng và audio AI bị bỏ (`coordinator.go`). Phần mất gồm độ trễ model (~40 ms) và phần dư < 20 ms, xảy ra khi cuộc gọi đã kết thúc nên không ai nghe. **Không** yêu cầu Gateway chờ final/drain RTP trước `CLOSING`.
+- **Phần đuôi khi đóng session được phát hết** (Gateway `e7cec01`, 24/11/2026; trước đó là quyết định 23/11/2026 chấp nhận mất đuôi). Gateway vẫn gửi EOS trong bước xả sau khi session chuyển `CLOSING`, nhưng session `noise_reduction` có `PlayoutOnClose`: egress vẫn phát audio AI ở `CLOSING`, và bước xả chờ AI trả final và hàng đợi egress phát hết, trong giới hạn `session.drain_timeout_ms`. Fallback không chạy khi đã `CLOSING`. Lab 24/11/2026 (G.722, L16) nhận đủ 1000/1000 khung. Phần đuôi đi ra **sau** khi session bị xóa (EOS chỉ được gửi trong bước xả sau `DELETE`), nên đến MF khi chặng gọi đã kết thúc (lab: khung cuối sau một bước nhảy ts ≈ thời gian từ gói cuối tới `DELETE`); vẫn giữ để phần đuôi không bị cắt khi MF còn nhận. **Vẫn mất:** ~40 ms cuối của âm thanh vào (độ trễ thuật toán của model: số mẫu ra bằng số mẫu vào), và mọi audio AI trả về sau `drain_timeout_ms`.
 
 ### 5.4. Ví dụ chuỗi bản tin
 
@@ -190,11 +190,11 @@ sequenceDiagram
     AI-->>GW: RecognitionResult #0, 640 B PCM, final=false, ts_end = rtp_ts chunk #1
     AI-->>GW: RecognitionResult #1, 640 B PCM, final=false, ts_end = rtp_ts chunk #1
     GW->>MF: RTP 20 ms theo pacer, không phát dồn
-    Note over GW: Cuộc gọi kết thúc: session CLOSING, egress dừng
+    Note over GW: Cuộc gọi kết thúc (DELETE): session CLOSING; noise_reduction: egress còn chạy (PlayoutOnClose)
     GW->>AI: AudioChunk end_of_stream=true (hoặc half-close)
     AI-->>GW: PCM còn lại, final=false
     AI-->>GW: RecognitionResult cuối, payload rỗng, final=true
-    Note over GW: Session đã CLOSING: bỏ audio đuôi (chấp nhận, §5.3)
+    Note over GW: Session CLOSING, noise_reduction: vẫn phát phần đuôi tới hết drain_timeout_ms (§5.3)
 ```
 
 ### 5.5. Hợp đồng với cơ chế fallback của Gateway
@@ -297,7 +297,7 @@ noise_reduction:
 | AI chậm/treo (không trả audio ≥ 500 ms) | — | FALLBACK `stalled`, hủy stream AI (AI nhận cancel) |
 | CPU không theo kịp: audio chờ model > `noise_reduction.max_backlog_ms` (500) | `RESOURCE_EXHAUSTED`, log `noise_reduction backlog` | Stream kết thúc ⇒ FALLBACK, phát audio gốc (thay vì nhận audio ngày càng trễ mà vẫn coi là khỏe) |
 | Format Gateway và AI không khớp | — | Không phát RTP sai định dạng; cảnh báo và tăng `media_ai_egress_audio_rejected_total{reason}`. Vì vẫn tính là đã trả audio nên **không** kích hoạt FALLBACK: MF nhận im lặng ⇒ phải bắt bằng test field 14 |
-| EOS sạch | Flush model, phát phần đuôi và một final rỗng | Session đã `CLOSING`: bỏ audio đuôi (chấp nhận, §5.3) |
+| EOS sạch | Flush model, phát phần đuôi và một final rỗng | Session `CLOSING`: vẫn phát phần đuôi, chờ final tối đa `drain_timeout_ms` (§5.3) |
 | Hủy cưỡng bức / mất mạng | Giải phóng tài nguyên ngay; không chờ vô hạn | — |
 
 Các lý do từ chối audio Gateway đã được tài liệu S7 ghi nhận: `format_unsupported`, `format_mismatch`, `bad_sample_rate`, `odd_bytes`, `unknown_format`, `encode_error`; không mặc định rằng mọi trường hợp lỗi đều đã được thử trên MF thật.
@@ -322,7 +322,7 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 | G.722 | AI PCM 640 byte / 20 ms | RTP PT 9 / 160 byte / TS +160 / pacing 20 ms |
 | L16 | AI PCM 640 byte / 20 ms | RTP PT cấu hình / 640 byte BE / TS +320 / pacing 20 ms |
 | G.711 legacy | Gateway `media.codec=pcm` | Kết quả, PT và callflow cũ không đổi |
-| Đóng session | EOS vs half-close vs hủy đột ngột | Không double flush; không treo RPC; (phía Gateway: audio đuôi bị bỏ — chấp nhận) |
+| Đóng session | EOS vs half-close vs hủy đột ngột | Không double flush; không treo RPC; phía Gateway phát hết phần đuôi trước khi đóng (lab: 1000/1000 khung) |
 | Hiệu năng | Nhiều luồng, 30 phút, tiếng nói và im lặng xen kẽ | Đo CPU/RAM/RTF, latency p95/p99, underrun; không dùng một con số giả định |
 | Chất lượng | Tiếng Việt sạch + nhiễu công trường, hội trường, bệnh viện, ga tàu, sân bay | Không làm mất lời nói; đánh giá nghe A/B, SIG/BAK/OVRL, STOI/SNR khi có clean target |
 | End-to-end | Gateway + AI thật + MF RTP thật | Có log/pcap chứng minh payload, thời gian và chất lượng hai chiều |
@@ -333,13 +333,13 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 
 | Thành phần | Đã có theo nguồn cung cấp | Công việc cần hoàn tất |
 |---|---|---|
-| Gateway G.722/L16 + `noise_reduction` | Nhánh `feature/noise-reduction-service`: S1–S8, dịch vụ `noise_reduction`, fallback F1–F4, chờ result có audio, đệm phát pacer, gửi field 14 (chưa commit); chạy thật với mock worker | Merge `master`; lab MF thật; F5 (tự phục hồi giữa cuộc gọi) là việc riêng |
+| Gateway G.722/L16 + `noise_reduction` | Nhánh `feature/noise-reduction-service`: S1–S8, dịch vụ `noise_reduction`, fallback F1–F4, chờ result có audio, đệm phát pacer, gửi field 14 (`336bd7c`), phát hết phần đuôi (`e7cec01`); chạy thật với mock worker và AI engine thật | Merge `master`; lab MF thật; F5 (tự phục hồi giữa cuộc gọi) là việc riêng |
 | Gateway — điểm yếu đã biết | Bộ đếm treo được xóa khi nhận **bất kỳ** result có audio (`grpc_client.go:508-511`), kể cả audio sau đó bị egress từ chối vì sai định dạng | Nếu muốn: chỉ tính audio egress nhận được (việc của Gateway, chưa làm) |
 | AI task router | Chunk đầu chọn task: `noise_reduction` ⇒ `NoiseReductionService` khi bật; STT không đổi (toàn bộ test STT cũ vẫn qua); `asr.enabled=false` ⇒ STT `UNIMPLEMENTED` (`29e08ed`) | — |
 | AI DPDFNet-2 | `denoise.py`: pool nạp sẵn, `NoiseStream` hai đường ra theo field 14, khung `frame_ms`, µ-law, hạ mẫu FIR (`e1dff04`); nạp model trong `serve()` (L4). Model thật: audio đầu tiên 16 ms, model 13–21 ms mỗi chunk 80 ms (CPU laptop, 1 luồng) | Đo trên CPU máy chủ để chọn `max_streams`/`workers`; đánh giá chất lượng trên thoại thật |
-| AI protobuf | **Đã đồng bộ** tag 14/15/16 + `AudioFormat`, sinh lại `speech_pb2.py` (2 bản), test `tests/test_proto_contract.py` (23/11/2026, chưa commit) | — |
+| AI protobuf | **Đã đồng bộ** tag 14/15/16 + `AudioFormat`, sinh lại `speech_pb2.py` (2 bản), test `tests/test_proto_contract.py` (`1eacc31`) | — |
 | AI gRPC result | `noise_service.py`: audio mọi chunk, `ts_end` theo §4 ràng buộc 6, một final rỗng, mã lỗi §8, một dòng log tóm tắt mỗi stream (`29e08ed`); chặn backlog `max_backlog_ms` (L5) | — |
-| Config và client | Khóa §7.2 trong `config.py`, `config/server.yaml`, README, `HUONG_DAN_CAI_DAT.md` (`22c7e09`, L4) | `scripts/update.sh` còn luôn đòi model ASR và chưa kiểm tra `noise_model` (chờ duyệt); client test `scripts/client.py` và `tools/eval` chưa gửi `noise_reduction` |
+| Config và client | Khóa §7.2 trong `config.py`, `config/server.yaml`, README, `HUONG_DAN_CAI_DAT.md` (`22c7e09`, L4) | `scripts/update.sh` chỉ kiểm tra model của task đang bật, kể cả `dpdfnet2.onnx` và `sherpa-onnx` (`fbc4e7d`, `be3549e`). Còn: client test `scripts/client.py` và `tools/eval` chưa gửi `noise_reduction` (lab dùng `media_ai/cmd/mock-mf-wav`) |
 | End-to-end | Mock AI wideband + fallback đã chạy thật phía Gateway | Dùng checkpoint DPDFNet-2 thật, stress/gap/cancel và kiểm thử chất lượng |
 
 **Quy trình triển khai đề xuất:** (1) ✅ đồng bộ protobuf; (2) config AI và routing; (3) denoiser + packetizer + final + `ts_end`; (4) test đơn vị và gRPC (gồm hợp đồng fallback §5.5); (5) test với Gateway G.722/L16 + PCMU bằng engine thật; (6) kiểm tra PCAP/RTF/QoE và triển khai có kiểm soát. Không coi tài liệu này là xác nhận source AI đã được cập nhật.
@@ -355,7 +355,7 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 7. **Clock RTP khác sample rate PCM** với G.722: 8000 tick/s vs 16000 mẫu/s.
 8. Gateway có trách nhiệm **encode RTP, pacing và fallback khi AI lỗi**; AI không sinh gói RTP.
 9. Mọi nội dung chưa chạy với checkpoint/model thật được ghi là **cần kiểm thử**, không diễn đạt thành kết quả đã nghiệm thu.
-10. **Chấp nhận mất audio đuôi khi đóng session**; Gateway không chờ final trước `CLOSING`.
+10. **Phần đuôi khi đóng session được phát hết** (Gateway `PlayoutOnClose`, chờ final tối đa `drain_timeout_ms`); chỉ mất ~40 ms độ trễ của model và audio AI trả về sau `drain_timeout_ms` (hoặc khi session đã ở fallback). Thay quyết định 23/11/2026 "chấp nhận mất đuôi".
 11. **`ts_end` = `rtp_timestamp` của chunk vào mới nhất** đã đưa vào model (`ts_start` = `ts_end`).
 12. **Audio cho mọi chunk, độ trễ < `fallback_after_ms`**; quá tải thì từ chối sớm.
 
@@ -364,6 +364,11 @@ Khi vận hành liên node, triển khai TLS/mTLS, xác thực nguồn gRPC, gi�
 **Kết luận thiết kế:** Một gRPC `SpeechStream.Recognize` phục vụ các task theo định tuyến tường minh. `speech_to_text` giữ nguyên. `noise_reduction` dùng DPDFNet-2 để trả audio **theo chunk bội 20 ms, liên tục cho mọi chunk**, theo định dạng Gateway yêu cầu ở `output_audio_format` (PCM16 16 kHz hoặc G.711 PCMU). Mỗi stream giữ state riêng và phát **một final rỗng duy nhất khi kết thúc**. Gateway dùng tag 15/16 để phân biệt PCM và G.711, mã hóa G.722/L16, phát RTP theo pacer, và phát audio gốc khi AI lỗi hoặc chậm quá `fallback_after_ms`. Đây là bản thiết kế duy nhất để cập nhật AI Engine và đối chiếu tích hợp Gateway trong giai đoạn tiếp theo.
 
 ## Lịch sử thay đổi
+
+**1.3 — 24/11/2026:**
+
+- Gateway `e7cec01` (`PlayoutOnClose`): session `noise_reduction` phát hết phần đuôi AI trả sau EOS trước khi đóng (giới hạn `drain_timeout_ms`); cập nhật §5.2, §5.3, §5.4, §8, §9, quyết định 10. Lab nhận đủ 1000/1000 khung (trước đó 999).
+- AI Engine: sửa sau review cả nhánh (`47fb3d8`): giới hạn 64 chunk chỉ áp khi tắt `max_backlog_ms`; chunk `end_of_stream` không bị chặn bởi ngưỡng; đóng RPC thì trả bộ lọc ngay; nạp bộ lọc thay thế trên luồng riêng.
 
 **1.2 — 23/11/2026** (code AI Engine trên nhánh `feature/noise-reduction`):
 

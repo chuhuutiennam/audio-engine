@@ -5,7 +5,7 @@
 #   BACKUP_ID      that saved version, as shown by --list
 #   --list         show the saved versions and change nothing
 # Restores the code, bin/, config/ and VERSION, starts the server and waits until it is ready.
-# The replaced version is kept in backup/rolled-back/<date>-<time>/.
+# The replaced version is kept in backup/rolled-back/<date>-<time>/ (UTC).
 # Nothing is changed when the saved configuration is not valid for the saved code.
 # Exit code: 0 = restored and ready, 1 = failed, 2 = wrong usage.
 set -euo pipefail

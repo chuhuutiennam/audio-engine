@@ -50,8 +50,8 @@ Không cần: `qwen-asr`, `webrtcvad`, `onnxruntime`, gói Python `silero-vad`, 
 | `config/*.dist` | Cấu hình mặc định của phiên bản vừa cài, để so sánh | Thay bằng bản mới |
 | `lib/asr_server/` | Mã của ứng dụng | Thay bằng bản mới |
 | `lib/asr_server.prev/` | Mã của phiên bản ngay trước, để đối chiếu | Thay bằng bản vừa bị thay |
-| `backup/<ngày>-<giờ>/` | Các phiên bản đã bị thay: mã, `bin/`, `config/`, `VERSION` | Thêm một bản, giữ tối đa 10 bản |
-| `backup/rolled-back/<ngày>-<giờ>/` | Các phiên bản bị thay khi rollback, để xem lại | Thêm một bản mỗi lần rollback, giữ tối đa 10 bản |
+| `backup/<ngày>-<giờ>/` | Các phiên bản đã bị thay: mã, `bin/`, `config/`, `VERSION`. Tên theo giờ UTC (giờ Việt Nam trừ 7); bản lưu trước khi đổi sang UTC mang giờ địa phương, bản mới luôn được đặt tên sau chúng | Thêm một bản, giữ tối đa 10 bản |
+| `backup/rolled-back/<ngày>-<giờ>/` | Các phiên bản bị thay khi rollback, để xem lại. Tên theo giờ UTC như `backup/` | Thêm một bản mỗi lần rollback, giữ tối đa 10 bản |
 | `logs/` | Log, file pid | Không đụng tới |
 | `model/` | Ba model | Không đụng tới |
 | `data/` | File audio thử, kết quả đo | Không đụng tới |

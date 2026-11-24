@@ -1,7 +1,7 @@
 # Shared by scripts/build.sh, scripts/update.sh, bin/rollback.sh and bin/wait_ready.sh.
 # Sourced, not executed.
 #
-# backup/<date>-<time>/              a version replaced by an update
+# backup/<date>-<time>/              a version replaced by an update (UTC; see new_backup_id)
 # backup/rolled-back/<date>-<time>/  a version replaced by a rollback, kept to be examined
 
 BIN_SCRIPTS="_common.sh _upgrade.sh start.sh stop.sh status.sh rollback.sh wait_ready.sh env.sh.example"
@@ -45,13 +45,38 @@ save_version() {
   mv "$2.new" "$2"
 }
 
-# Prints an unused name for a saved version in directory $1.
+# Prints the name $2 seconds after name $1 (YYYYmmdd-HHMMSS, UTC); fails when $1 is no real date
+# or the result is no valid name (needs GNU date).
+shift_backup_id() {
+  local out
+  out="$(date -u -d "${1:0:4}-${1:4:2}-${1:6:2} ${1:9:2}:${1:11:2}:${1:13:2} UTC + $2 seconds" \
+         +%Y%m%d-%H%M%S 2>/dev/null)" || return 1
+  [[ "$out" =~ $BACKUP_ID_PATTERN ]] || return 1
+  echo "$out"
+}
+
+# Prints an unused name for a saved version in directory $1: the UTC time, so that a clock change
+# cannot make a newer version sort before an older one, and always after the newest saved name
+# (names given before UTC was used are in local time, up to 14 hours ahead of UTC). A saved name
+# that is no real date, or lies more than a day ahead of the clock, is ignored with a warning.
 new_backup_id() {
-  local id
-  id="$(date +%Y%m%d-%H%M%S)"
-  while [ -e "$1/$id" ]; do
-    sleep 1
-    id="$(date +%Y%m%d-%H%M%S)"
+  local id now limit name newest=""
+  now="$(date -u +%Y%m%d-%H%M%S)"
+  limit="$(shift_backup_id "$now" 86400)"
+  for name in $(saved_versions "$1"); do
+    if [[ "$name" > "$limit" ]] || ! shift_backup_id "$name" 0 > /dev/null; then
+      echo "warning: saved version name $name ignored for the order (no date within a day of now)" >&2
+      continue
+    fi
+    newest="$name"
+    break
+  done
+  id="$now"
+  if [ -n "$newest" ] && [[ ! "$id" > "$newest" ]]; then
+    id="$(shift_backup_id "$newest" 1)" || return 1
+  fi
+  while [ -e "$1/$id" ]; do          # only an ignored name can be in the way; ids only go up
+    id="$(shift_backup_id "$id" 1)" || return 1
   done
   echo "$id"
 }
