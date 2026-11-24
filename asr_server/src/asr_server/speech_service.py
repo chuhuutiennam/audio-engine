@@ -5,6 +5,8 @@ Transcript  -> RecognitionResult        (RTP ticks, language codes, seq, reason 
 
 The task of the first chunk picks the pipeline: noise_reduction goes to
 noise_service.NoiseReductionService when it is on; everything below is speech_to_text.
+With asr_denoise on, the audio of a speech_to_text stream goes through stt_denoise.SttDenoiser
+(DPDFNet-2) before the core: the checks below still see the chunks as sent.
 
 Contract enforced here (see README, "gRPC contract"):
 - one RPC carries one (session_id, stream_id); the session fields of the first
@@ -121,14 +123,16 @@ class _Stream:
 
 
 class SpeechStreamService(pb_grpc.SpeechStreamServicer):
-    def __init__(self, core, *, use_language_source=False, word_reveal=None, noise=None):
+    def __init__(self, core, *, use_language_source=False, word_reveal=None, noise=None, stt_denoise=None):
         """`core`: the speech_to_text core (server.ASRService); None = asr.enabled is false.
         `word_reveal`: (window_ms, min_interval_ms) to reveal PARTIALs word by word; None = off.
-        `noise`: noise_service.NoiseReductionService; None = noise_reduction is off."""
+        `noise`: noise_service.NoiseReductionService; None = noise_reduction is off.
+        `stt_denoise`: stt_denoise.SttDenoiser in front of VAD and ASR; None = asr_denoise is off."""
         self.core = core
         self.use_language_source = bool(use_language_source)
         self.word_reveal = word_reveal
         self.noise = noise
+        self.stt_denoise = stt_denoise
 
     # ------------------------------------------------------------------ input
     def _language_code(self, chunk):
@@ -286,7 +290,11 @@ class SpeechStreamService(pb_grpc.SpeechStreamServicer):
                     yield m.StreamRequest(end_stream=m.EndStream())
                     return
 
-        transcripts = self.core.StreamRecognize(requests(), context)
+        stream_requests = requests()
+        if self.stt_denoise is not None and first is not None and self.stt_denoise.applies(first):
+            # The checks above still see every chunk as sent; only the audio the core gets changes.
+            stream_requests = self.stt_denoise.stream(stream_requests, first.session_id, first.stream_id)
+        transcripts = self.core.StreamRecognize(stream_requests, context)
         if self.word_reveal is not None:
             transcripts = paced_transcripts(transcripts, WordPacer(*self.word_reveal))
         try:

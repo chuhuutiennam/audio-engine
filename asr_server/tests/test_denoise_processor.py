@@ -142,31 +142,6 @@ def test_a_model_short_at_the_end_is_completed_with_the_input():
     assert processor.filled == 100
 
 
-# ------------------------------------------------------------------------- bypass
-@pytest.mark.parametrize('at', [0, 2, 5, 17])           # chunks of 20 ms run before the bypass
-def test_bypass_returns_the_input_from_the_next_sample_on(at):
-    x = tone(0.6)
-    model = DelayedDenoiser(gain=0.5)
-    processor = DPDFNet2Processor(model, align=True)
-    pieces = chunks(x, 320)
-    before = [processor.run(piece) for piece in pieces[:at]]
-    done = sum(len(b) for b in before)
-    runs = model.runs
-    processor.bypass('test')
-    after = [processor.run(piece) for piece in pieces[at:]] + [processor.finish()]
-    out = np.concatenate(before + after)
-    assert len(out) == len(x)                                     # nothing lost or repeated
-    assert np.allclose(out[:done], 0.5 * x[:done], atol=1e-7)     # denoised up to the switch
-    assert np.array_equal(out[done:], x[done:])                   # then the input itself
-    assert (model.runs, model.flushes) == (runs, 0)               # the model is not used any more
-    assert processor.bypassed == 'test'
-
-
-def test_bypass_needs_the_aligned_timeline():
-    with pytest.raises(RuntimeError):
-        DPDFNet2Processor(DelayedDenoiser(), align=False).bypass('test')
-
-
 # ------------------------------------------------------------------- PCM16 bytes
 def test_feed_and_flush_pcm16():
     x = tone(0.5)
@@ -225,30 +200,13 @@ class FailingDenoiser(DelayedDenoiser):
         return super().flush()
 
 
-def test_a_model_failing_at_the_end_loses_nothing_after_a_bypass():
-    x = tone(0.5)
-    processor = DPDFNet2Processor(FailingDenoiser(gain=0.5, fail_flush=True), align=True)
-    before = [processor.run(piece) for piece in chunks(x, 640)]
+def test_a_model_failing_at_the_end_leaves_the_processor_open():
+    """stt_denoise then goes on with its own copy of the input; finish() may be called again."""
+    processor = DPDFNet2Processor(FailingDenoiser(fail_flush=True), align=True)
+    processor.run(tone(0.2))
     with pytest.raises(RuntimeError, match='model failed'):
         processor.finish()
-    processor.bypass('model error')
-    out = np.concatenate(before + [processor.finish()])
-    done = sum(len(b) for b in before)
-    assert len(out) == len(x)
-    assert np.allclose(out[:done], 0.5 * x[:done], atol=1e-7) and np.array_equal(out[done:], x[done:])
-
-
-def test_a_model_failing_mid_stream_loses_nothing_after_a_bypass():
-    x = tone(0.5)
-    processor = DPDFNet2Processor(FailingDenoiser(gain=0.5, fail_run_at=6), align=True)
-    out = []
-    for piece in chunks(x, 640):
-        try:
-            out.append(processor.run(piece))
-        except RuntimeError:
-            processor.bypass('model error')         # the chunk the model failed on is kept
-    out = np.concatenate(out + [processor.finish()])
-    assert len(out) == len(x) and processor.samples_out == len(x)
+    assert not processor.finished
 
 
 class EarlyDenoiser(DelayedDenoiser):

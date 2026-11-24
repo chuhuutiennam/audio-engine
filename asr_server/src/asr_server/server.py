@@ -692,6 +692,30 @@ def _build_noise(args):
                                  max_backlog_ms=args.noise_max_backlog_ms)
 
 
+def _build_stt_denoise(args):
+    """asr_denoise.enabled: check the model's delay, load the denoisers of speech_to_text."""
+    from . import denoise
+    from .stt_denoise import SttDenoiser
+    LOG.info('loading %d DPDFNet-2 denoisers for speech_to_text (%d ONNX threads each) from %s',
+             args.stt_denoise_max_streams, args.stt_denoise_num_threads, args.stt_denoise_model)
+    started = time.monotonic()
+    try:
+        factory = denoise.dpdfnet2_factory(args.stt_denoise_model, args.stt_denoise_num_threads,
+                                           setting='asr_denoise')
+        # VAD/ASR timestamps rely on the delay the alignment removes: another model would shift them.
+        denoise.check_model_delay(factory)
+        pool = denoise.DenoiserPool(factory, args.stt_denoise_max_streams)
+    except Exception as exc:
+        # In the log file too: bin/start.sh sends the traceback to logs/asr-server.out only.
+        LOG.error('asr_denoise cannot start: %s: %s', type(exc).__name__, exc)
+        raise
+    LOG.info('asr_denoise on: %d denoisers loaded in %.1f s, %d worker threads, apply_to=%s, '
+             'max_backlog_ms=%d', pool.size, time.monotonic() - started, args.stt_denoise_workers,
+             args.stt_denoise_apply_to, args.stt_denoise_max_backlog_ms)
+    return SttDenoiser(pool, workers=args.stt_denoise_workers, max_backlog_ms=args.stt_denoise_max_backlog_ms,
+                       apply_to=args.stt_denoise_apply_to)
+
+
 async def serve(args):
     """Load models and serve until terminated. `args` is asr_server.config.Settings."""
     os.environ['HF_HUB_OFFLINE'] = '1'
@@ -700,8 +724,11 @@ async def serve(args):
     os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
     # The denoisers first: CPU only, and a missing model stops the start before ASR takes GPU memory.
     noise = _build_noise(args) if args.noise_enabled else None
+    stt_denoise = None
     service = None
     try:
+        if args.stt_denoise_enabled:
+            stt_denoise = _build_stt_denoise(args)
         if args.asr_enabled:
             service = _build_asr(args)
         else:
@@ -715,7 +742,8 @@ async def serve(args):
         from .speech_service import SpeechStreamService
         speech_pb2_grpc.add_SpeechStreamServicer_to_server(
             SpeechStreamService(service, use_language_source=args.use_language_source,
-                                word_reveal=args.word_reveal, noise=noise), server)
+                                word_reveal=args.word_reveal, noise=noise, stt_denoise=stt_denoise),
+            server)
         addr = f'{args.host}:{args.port}'
         if server.add_insecure_port(addr) == 0:
             raise RuntimeError(f'failed to bind {addr}')
@@ -730,5 +758,9 @@ async def serve(args):
             if service is not None:
                 service.close()
         finally:
-            if noise is not None:
-                noise.close()           # after server.stop(): no RPC uses it any more
+            try:
+                if noise is not None:
+                    noise.close()       # after server.stop(): no RPC uses it any more
+            finally:
+                if stt_denoise is not None:
+                    stt_denoise.close()

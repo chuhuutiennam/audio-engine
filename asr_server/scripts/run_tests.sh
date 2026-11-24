@@ -14,7 +14,7 @@ cd "$ROOT"
 # the process, was gone after an earlier test's event loop closed. One file per process makes
 # that far less likely; it was never seen within one file. tests/test_run_tests_script.py keeps
 # this list complete.
-GRPC_SERVER_TESTS="tests/test_force_language.py tests/test_noise_grpc.py tests/test_regression.py tests/test_result_log.py tests/test_serve_noise.py tests/test_speech_grpc.py tests/test_word_pacer.py"
+GRPC_SERVER_TESTS="tests/test_force_language.py tests/test_noise_grpc.py tests/test_regression.py tests/test_result_log.py tests/test_serve_noise.py tests/test_speech_grpc.py tests/test_stt_denoise.py tests/test_word_pacer.py"
 # The same for tools/eval/tests (paths relative to tools/eval).
 EVAL_GRPC_SERVER_TESTS="tests/test_dual_wer.py tests/test_eval_wav_grpc.py tests/test_vram_and_clean.py"
 

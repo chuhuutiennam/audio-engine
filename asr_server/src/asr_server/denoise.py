@@ -6,8 +6,8 @@ Design: docs/DPDFNet2_Task_Routing_Design_VI.md (audio-engine repo root), sectio
   CPU, and the gateway gives up on a stream that returns no audio for 500 ms. A stream borrows
   one and gives it back reset.
 - DPDFNet2Processor: the model path of one stream, shared by both uses. In and out: 16 kHz
-  audio. align=True (speech_to_text) removes the model's delay so that VAD and ASR keep the
-  input's timeline.
+  audio. align=True (speech_to_text, stt_denoise.py) removes the model's delay so that VAD and
+  ASR keep the input's timeline.
 - NoiseStream: the audio path of one noise_reduction stream. In: PCM16 LE mono 16 kHz. Out:
   frames of frame_ms, either PCM16 LE mono 16 kHz or G.711 PCMU 8 kHz
   (AudioChunk.output_audio_format).
@@ -38,18 +38,19 @@ FRAME_MS = (20, 40, 80)        # the gateway wants multiples of 20 ms
 MODEL_DELAY = 640              # samples (40 ms): output n carries input n - 640 (cross-correlation)
 
 
-def dpdfnet2_factory(model_path, num_threads=1):
+def dpdfnet2_factory(model_path, num_threads=1, setting='noise_reduction'):
     """Factory of DPDFNet-2 denoisers: sherpa_onnx.OnlineSpeechDenoiser on CPU, 16 kHz.
 
     Checks the model file and the package now, so that a bad setup stops the start before any
     model loads. Measured with sherpa-onnx 2.0.2 and dpdfnet2.onnx (SHA-256 ce35d602...87a9).
+    `setting`: the config section the errors name (noise_reduction or asr_denoise).
     """
     if not os.path.isfile(model_path):
-        raise FileNotFoundError(f'missing local DPDFNet-2 model (noise_reduction.model): {model_path}')
+        raise FileNotFoundError(f'missing local DPDFNet-2 model ({setting}.model): {model_path}')
     try:
         import sherpa_onnx
     except ImportError as exc:              # not installed, or its native library does not load
-        raise ImportError('noise_reduction.enabled needs the sherpa-onnx package '
+        raise ImportError(f'{setting}.enabled needs the sherpa-onnx package '
                           f'(sherpa-onnx==2.0.2, see requirements.txt); importing it failed: {exc}') from exc
     config = sherpa_onnx.OnlineSpeechDenoiserConfig(model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
         dpdfnet=sherpa_onnx.OfflineSpeechDenoiserDpdfNetModelConfig(model=model_path),
@@ -104,12 +105,11 @@ class DPDFNet2Processor:
     align=True: output sample k is input sample k, denoised. The first MODEL_DELAY samples the
       model returns are dropped, and finish() feeds MODEL_DELAY samples of silence before the
       model flush, so the output has exactly as many samples as the input, on its timeline
-      (VAD and ASR timestamps stay right). The input not yet returned is kept for bypass() and
-      for a model that would return too few samples at the end (`filled` counts those).
+      (VAD and ASR timestamps stay right). The input not yet returned is kept for a model that
+      would return too few samples at the end (`filled` counts those).
 
-    bypass(reason), align=True only: from now on the input passes unchanged, starting with the
-    input samples not yet returned, so no sample is lost or repeated. The model is not called
-    any more.
+    When the model fails, the caller goes on without it: stt_denoise keeps its own copy of the
+    input not yet returned, because a slow model call may still be using this object.
     """
 
     def __init__(self, denoiser, *, align=False):
@@ -118,7 +118,6 @@ class DPDFNet2Processor:
         self._skip = MODEL_DELAY if align else 0        # model output still to drop
         self._pending = np.zeros(0, dtype=np.float32)   # align: input not yet returned
         self.finished = False
-        self.bypassed = None            # reason, once bypass() was called
         self.samples_in = 0
         self.samples_out = 0
         self.filled = 0                 # samples the model did not return, taken from the input
@@ -147,22 +146,15 @@ class DPDFNet2Processor:
         self.samples_in += len(samples)
         if self.align:
             self._pending = np.concatenate([self._pending, samples])
-        if self.bypassed is not None:
-            return self._ready(self._pending.copy())
         if not len(samples):
             return samples
         return self._ready(self._model(self.denoiser.run(samples, SAMPLE_RATE)))
 
     def finish(self):
-        """End of the stream: the rest of the audio. The model is flushed once (not after bypass).
-
-        When the model fails here, the stream stays open: after bypass(), finish() returns the
-        input not yet returned, so the end of the stream is not lost."""
+        """End of the stream: the rest of the audio. The model is flushed once. When the model
+        fails here the processor stays open (finished is set only after the model calls)."""
         if self.finished:
             raise RuntimeError('denoiser stream already finished')
-        if self.bypassed is not None:
-            self.finished = True
-            return self._ready(self._pending.copy())
         parts = []
         if self.align:
             parts.append(self._model(self.denoiser.run(np.zeros(MODEL_DELAY, dtype=np.float32), SAMPLE_RATE)))
@@ -178,12 +170,6 @@ class DPDFNet2Processor:
                 out = np.concatenate([out, self._pending[len(out):]])
             out = out[:len(self._pending)]
         return self._ready(out)
-
-    def bypass(self, reason):
-        if not self.align:
-            raise RuntimeError('bypass needs align=True: only then is the input on the output timeline')
-        if self.bypassed is None:
-            self.bypassed = reason
 
     def feed(self, pcm):
         """PCM16 LE mono 16 kHz in and out."""

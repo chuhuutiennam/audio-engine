@@ -154,3 +154,34 @@ def test_grpc_stream_with_the_real_model_and_its_log_line(caplog):
     assert fields['outcome'] == 'final'
     assert fields['samples_in'] == fields['samples_out'] == fields['samples_sent'] == str(len(pcm) // 2)
     assert int(fields['first_audio_ms']) < 500                 # the gateway falls back after 500 ms
+
+
+def test_stt_denoise_stage_with_the_real_model(caplog):
+    """asr_denoise in front of the core: the requests the core gets from the real model.
+    (No delay left: test_aligned_processor_keeps_the_input_timeline, on the float output.)"""
+    from asr_server import messages as m
+    from asr_server.stt_denoise import SttDenoiser
+    pcm = noisy_speech_like(4.0)
+
+    async def requests():
+        yield m.StreamRequest(config=m.StreamConfig(call_id='c', leg_id='l', encoding=m.PCM_S16LE,
+                                                    sample_rate=RATE))
+        for n, p in enumerate(range(0, len(pcm), 2560), 1):
+            yield m.StreamRequest(audio=m.AudioChunk(data=pcm[p:p + 2560], sequence=n))
+        yield m.StreamRequest(end_stream=m.EndStream())
+
+    stage = SttDenoiser(DenoiserPool(dpdfnet2_factory(MODEL), 1), max_backlog_ms=0)
+
+    async def run():
+        return [r async for r in stage.stream(requests(), 's', 't')]
+    with caplog.at_level(logging.INFO, logger='qwen3_asr.stt_denoise'):
+        out = asyncio.run(run())
+    stage.close()
+    kinds = [r.WhichOneof('payload') for r in out]
+    assert kinds[0] == 'config' and kinds[-1] == 'end_stream' and set(kinds[1:-1]) == {'audio'}
+    audio = [r.audio for r in out[1:-1]]
+    assert [a.sequence for a in audio] == list(range(1, len(audio) + 1))
+    y = np.frombuffer(b''.join(a.data for a in audio), '<i2')
+    assert len(y) == len(pcm) // 2 and stage.stats['denoised'] == 1
+    assert y.tobytes() != pcm                                 # the model changed the audio
+    assert any('outcome=denoised' in r.getMessage() for r in caplog.records)
